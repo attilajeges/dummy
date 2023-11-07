@@ -43,6 +43,6 @@ future<> demo_with_file(sstring filename) {
 
 future<> f() {
     return smp::invoke_on_all([] {
-            return demo_with_file("/home/attilaj/work/data.txt");
+            return demo_with_file("/home/attilaj/dummy/data.txt");
         });
 }
