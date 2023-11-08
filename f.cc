@@ -88,8 +88,8 @@ future<sstring> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_
         });
 }
 
-future<std::vector<sstring>> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_size) {
-    fmt::print("filename {} size {} max_buffer_size {}\n", filename, size, max_buffer_size);
+future<std::vector<sstring>> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_size, uint64_t min_buffer_size) {
+    fmt::print("filename {} size {} max_buffer_size {} min_buffer_size {}\n", filename, size, max_buffer_size, min_buffer_size);
 
     uint64_t record_count = size / record_size; 
     uint64_t max_record_count_per_shard = record_count / smp::count + (record_count % smp::count ? 1 : 0);
@@ -97,11 +97,12 @@ future<std::vector<sstring>> external_merge(sstring filename, uint64_t size, uin
     if (max_byte_count_per_shard <= max_buffer_size) {
         std::vector<future<sstring>> futures;
         uint64_t offset = 0;
-        for (uint64_t shard_id = 0; (shard_id < smp::count && offset < size); ++shard_id) {
+        for (uint64_t shard_id = 0; shard_id < smp::count; ++shard_id) {
             uint64_t chunk_size = (offset + max_byte_count_per_shard <= size) ? max_byte_count_per_shard : (size - offset);
             chunk_size = chunk_size / record_size * record_size;
             if (chunk_size == 0)
                 break;
+            chunk_size = std::max(chunk_size, min_buffer_size);
 
             futures.push_back(
                 smp::submit_to(shard_id, smp_submit_to_options(), [filename, offset, chunk_size] {
@@ -115,10 +116,16 @@ future<std::vector<sstring>> external_merge(sstring filename, uint64_t size, uin
     return make_ready_future<std::vector<sstring>>();
 }
 
-future<> check_params(uint64_t max_buffer_size) {
-    if (max_buffer_size < record_size) {
+future<> check_params(uint64_t max_buffer_size, uint64_t min_buffer_size) {
+    if (max_buffer_size < min_buffer_size) {
        std::ostringstream os;
-       os << "Max buffer size (" << max_buffer_size << ") should be at least the record size (" << record_size << ")";
+       os << "Max buffer size (" << max_buffer_size << ") should be greater than or equal to min buffer size (" << min_buffer_size << ")";
+       throw std::runtime_error(os.str());
+    }
+
+    if (max_buffer_size % record_size != 0 || min_buffer_size % record_size != 0) {
+       std::ostringstream os;
+       os << "Max buffer size (" << max_buffer_size << ") and min buffer size (" << min_buffer_size << ") should both be multiplies of record size (" << record_size << ")";
        throw std::runtime_error(os.str());
     }
     return make_ready_future<>();
@@ -138,16 +145,18 @@ future<> f() {
  
     sstring filename = "/home/attilaj/dummy/data.txt";
     // uint64_t max_buffer_size = 1UL << 30; // 1G
+    // uint64_t min_buffer_size = 1UL << 20; // 1M
     uint64_t max_buffer_size = 4096UL;
+    uint64_t min_buffer_size = 4096UL;
 
     return when_all_succeed(
             file_size(filename),
             file_accessible(filename, access_flags::exists | access_flags::read),
-            check_params(max_buffer_size)
-        ).then_unpack([filename, max_buffer_size] (uint64_t size, bool accessible) {
+            check_params(max_buffer_size, min_buffer_size)
+        ).then_unpack([filename, max_buffer_size, min_buffer_size] (uint64_t size, bool accessible) {
             if (!accessible)
                 throw std::runtime_error(filename + " file is not accessible");
-            return external_merge(filename, size, max_buffer_size);        
+            return external_merge(filename, size, max_buffer_size, min_buffer_size);
         }).then([](std::vector<sstring> filenames){
             for (const auto& fn: filenames)
                 fmt::print("Created filename: {}\n", fn);
