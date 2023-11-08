@@ -1,6 +1,7 @@
 #include <seastar/core/future.hh>
 #include <iostream>
 #include <vector>
+#include <algorithm>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/smp.hh>
@@ -17,11 +18,37 @@ using namespace seastar;
 constexpr size_t aligned_size = 4096;
 constexpr size_t record_size = 4096;
 
+
+struct record_type { 
+    char _buf[record_size];
+
+    record_type(const record_type &other) {
+      strncpy(_buf, other._buf, record_size);
+    }
+    record_type &operator=(const record_type &other) {
+      strncpy(_buf, other._buf, record_size);
+      return *this;
+    }
+    bool operator<(const record_type &other) const {
+      return strncmp(_buf, other._buf, record_size) < 0;
+    }
+};
+
 future<> read_file(sstring filename, temporary_buffer<char>& rbuf, uint64_t offset, uint64_t chunk_size) {
     return with_file(open_file_dma(filename, open_flags::ro), [&rbuf, offset, chunk_size] (file& f) {
-        return f.dma_read(offset, rbuf.get_write(), chunk_size).then([&rbuf] (size_t count) {
+        return f.dma_read(offset, rbuf.get_write(), chunk_size).then([&rbuf, chunk_size] (size_t count) {
             fmt::print("    read count {}\n", count);
-            assert(count == aligned_size);
+            assert(count == chunk_size);
+            return make_ready_future<>();
+        });
+    });
+}
+
+future<> write_file(sstring filename, temporary_buffer<char>& rbuf, uint64_t size) {
+    return with_file(open_file_dma(filename, open_flags::wo | open_flags::create), [&rbuf, size] (file& f) {
+        return f.dma_write(0, rbuf.get(), size).then([&rbuf, size] (size_t count) {
+            fmt::print("    write count {}\n", count);
+            assert(count == size);
             return make_ready_future<>();
         });
     });
@@ -43,7 +70,12 @@ future<> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_size) {
 
     auto rbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
     return do_with(std::move(rbuf), [filename, offset, chunk_size](auto &rbuf) {
-            return read_file(filename, rbuf, offset, chunk_size);
+            return read_file(filename, rbuf, offset, chunk_size).then([&rbuf, chunk_size] {
+                    record_type *record_buffer = reinterpret_cast<record_type*>(rbuf.get(), rbuf.size());
+                    std::sort(record_buffer,
+                        record_buffer + chunk_size / record_size);
+                }).then([&rbuf] {
+                });
         });
 }
 
