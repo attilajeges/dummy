@@ -27,7 +27,7 @@ future<> read_file(sstring filename, temporary_buffer<char>& rbuf) {
     });
 }
 
-future<> demo_with_file(sstring filename) {
+future<> read_and_sort(sstring filename) {
     fmt::print("Demonstrating with_file():\n");
     fmt::print(": smp::count {}\n", smp::count);
     fmt::print(": smp::this_shard_id() {}\n", this_shard_id());
@@ -56,8 +56,8 @@ future<> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_siz
         futures.reserve(smp::count);
         for (uint64_t shard_id = 0; shard_id < smp::count; ++shard_id) {
             futures.push_back(
-                smp::submit_to(0, smp_submit_to_options(), [] {
-                        return demo_with_file("/home/attilaj/dummy/data.txt");
+                smp::submit_to(0, smp_submit_to_options(), [filename] {
+                        return read_and_sort(filename);
                     }));
         }
         return when_all_succeed(std::move(futures));
