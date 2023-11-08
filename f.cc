@@ -76,9 +76,9 @@ future<> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_size) {
                     record_type *record_buffer = reinterpret_cast<record_type*>(rbuf.get_write());
                     std::sort(record_buffer,
                         record_buffer + chunk_size / record_size);
-                }).then([filename, &rbuf, chunk_size] {
+                }).then([filename, offset, chunk_size, &rbuf] {
                     std::ostringstream os;
-                    os << filename << "-" << this_shard_id();
+                    os << filename << "-" << this_shard_id() << "-" << offset;
                     fmt::print("out_filename {} \n", os.str());
                     return write_file(os.str(), rbuf, chunk_size);
                 });
@@ -107,6 +107,7 @@ future<> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_siz
             offset +=  chunk_size;
         } 
         return when_all_succeed(std::move(futures));
+    } else {
     }
     return make_ready_future<>();
 }
