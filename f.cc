@@ -56,7 +56,7 @@ future<> write_file(sstring filename, temporary_buffer<char>& rbuf, uint64_t siz
     });
 }
 
-future<> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_size) {
+future<sstring> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_size) {
     fmt::print("read_and_sort");
     fmt::print("-------- smp::count {}\n", smp::count);
     fmt::print("-------- this_shard_id() {}\n", this_shard_id());
@@ -79,20 +79,23 @@ future<> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_size) {
                 }).then([filename, offset, chunk_size, &rbuf] {
                     std::ostringstream os;
                     os << filename << "-" << this_shard_id() << "-" << offset;
-                    fmt::print("out_filename {} \n", os.str());
-                    return write_file(os.str(), rbuf, chunk_size);
+                    sstring out_filename{os.str()};
+                    fmt::print("out_filename {} \n", out_filename);
+                    return write_file(os.str(), rbuf, chunk_size).then([out_filename] {
+                            return out_filename;
+                        });
                 });
         });
 }
 
-future<> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_size) {
+future<std::vector<sstring>> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_size) {
     fmt::print("filename {} size {} max_buffer_size {}\n", filename, size, max_buffer_size);
 
     uint64_t record_count = size / record_size; 
     uint64_t max_record_count_per_shard = record_count / smp::count + (record_count % smp::count ? 1 : 0);
     uint64_t max_byte_count_per_shard = max_record_count_per_shard * record_size; 
     if (max_byte_count_per_shard <= max_buffer_size) {
-        std::vector<future<>> futures;
+        std::vector<future<sstring>> futures;
         uint64_t offset = 0;
         for (uint64_t shard_id = 0; (shard_id < smp::count && offset < size); ++shard_id) {
             uint64_t chunk_size = (offset + max_byte_count_per_shard <= size) ? max_byte_count_per_shard : (size - offset);
@@ -108,6 +111,15 @@ future<> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_siz
         } 
         return when_all_succeed(std::move(futures));
     } else {
+    }
+    return make_ready_future<std::vector<sstring>>();
+}
+
+future<> check_params(uint64_t max_buffer_size) {
+    if (max_buffer_size < record_size) {
+       std::ostringstream os;
+       os << "Max buffer size (" << max_buffer_size << ") should be at least the record size (" << record_size << ")";
+       throw std::runtime_error(os.str());
     }
     return make_ready_future<>();
 }
@@ -130,17 +142,15 @@ future<> f() {
 
     return when_all_succeed(
             file_size(filename),
-            file_accessible(filename, access_flags::exists | access_flags::read)
+            file_accessible(filename, access_flags::exists | access_flags::read),
+            check_params(max_buffer_size)
         ).then_unpack([filename, max_buffer_size] (uint64_t size, bool accessible) {
             if (!accessible)
                 throw std::runtime_error(filename + " file is not accessible");
             return external_merge(filename, size, max_buffer_size);        
-        }).then([max_buffer_size] {
-            if (max_buffer_size < record_size) {
-                std::ostringstream os;
-                os << "Max buffer size (" << max_buffer_size << ") should be at least the record size (" << record_size << ")";
-                throw std::runtime_error(os.str());
-            }
+        }).then([](std::vector<sstring> filenames){
+            for (const auto& fn: filenames)
+                fmt::print("Created filename: {}\n", fn);
         }).handle_exception([] (std::exception_ptr e) {
             std::cout << "Exception: " << e << "\n";
         });
