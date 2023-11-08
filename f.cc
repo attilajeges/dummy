@@ -124,15 +124,22 @@ future<> f() {
     //     });
  
     sstring filename = "/home/attilaj/dummy/data.txt";
-    uint64_t max_buffer_size = 1024UL * 1024UL * 1024UL;
+    // uint64_t max_buffer_size = 1UL << 30; // 1G
+    uint64_t max_buffer_size = 4096UL;
 
     return when_all_succeed(
             file_size(filename),
             file_accessible(filename, access_flags::exists | access_flags::read)
         ).then_unpack([filename, max_buffer_size] (uint64_t size, bool accessible) {
             if (!accessible)
-                throw std::runtime_error(filename + " is not accessible");
+                throw std::runtime_error(filename + " file is not accessible");
             return external_merge(filename, size, max_buffer_size);        
+        }).then([max_buffer_size] {
+            if (max_buffer_size < record_size) {
+                std::ostringstream os;
+                os << "Max buffer size (" << max_buffer_size << ") should be at least the record size (" << record_size << ")";
+                throw std::runtime_error(os.str());
+            }
         }).handle_exception([] (std::exception_ptr e) {
             std::cout << "Exception: " << e << "\n";
         });
