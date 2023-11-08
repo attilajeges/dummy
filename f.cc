@@ -17,9 +17,9 @@ using namespace seastar;
 constexpr size_t aligned_size = 4096;
 constexpr size_t record_size = 4096;
 
-future<> read_file(sstring filename, temporary_buffer<char>& rbuf) {
-    return with_file(open_file_dma(filename, open_flags::ro), [&rbuf] (file& f) {
-        return f.dma_read(0, rbuf.get_write(), aligned_size).then([&rbuf] (size_t count) {
+future<> read_file(sstring filename, temporary_buffer<char>& rbuf, uint64_t offset, uint64_t chunk_size) {
+    return with_file(open_file_dma(filename, open_flags::ro), [&rbuf, offset, chunk_size] (file& f) {
+        return f.dma_read(offset, rbuf.get_write(), chunk_size).then([&rbuf] (size_t count) {
             fmt::print("    read count {}\n", count);
             assert(count == aligned_size);
             return make_ready_future<>();
@@ -41,9 +41,9 @@ future<> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_size) {
     //     read_file(filename, rbuf).get();
     // });
 
-    auto rbuf = temporary_buffer<char>::aligned(aligned_size, 1000000000);
-    return do_with(std::move(rbuf), [filename](auto &rbuf) {
-            return read_file(filename, rbuf);
+    auto rbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
+    return do_with(std::move(rbuf), [filename, offset, chunk_size](auto &rbuf) {
+            return read_file(filename, rbuf, offset, chunk_size);
         });
 }
 
@@ -53,15 +53,17 @@ future<> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_siz
     uint64_t record_count = size / record_size; 
     uint64_t max_record_count_per_shard = record_count / smp::count + (record_count % smp::count ? 1 : 0);
     uint64_t max_byte_count_per_shard = max_record_count_per_shard * record_size; 
-    if (max_record_count_per_shard * record_size <= max_buffer_size) {
+    if (max_byte_count_per_shard <= max_buffer_size) {
         std::vector<future<>> futures;
         uint64_t offset = 0;
         for (uint64_t shard_id = 0; (shard_id < smp::count && offset < size); ++shard_id) {
             uint64_t chunk_size = (offset + max_byte_count_per_shard <= size) ? max_byte_count_per_shard : (size - offset);
-            futures.push_back(
-                smp::submit_to(0, smp_submit_to_options(), [filename, offset, chunk_size] {
-                        return read_and_sort(filename, offset, chunk_size);
-                    }));
+            if (chunk_size % record_size == 0) {
+              futures.push_back(
+                  smp::submit_to(0, smp_submit_to_options(), [filename, offset, chunk_size] {
+                          return read_and_sort(filename, offset, chunk_size);
+                      }));
+            }
             offset +=  chunk_size;
         }
         return when_all_succeed(std::move(futures));
