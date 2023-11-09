@@ -92,38 +92,44 @@ future<std::vector<std::vector<sstring>>> futures_for_initial_sort(sstring filen
     std::vector<future<std::vector<sstring>>> futures;
     uint64_t offset = 0;
     while (offset < size) {
-        std::vector<future<sstring>> next_iteration_futures;
-        for (uint64_t shard_id = 0; shard_id < smp::count; ++shard_id) {
+        std::vector<future<sstring>> futures_in_iteration;
+        for (uint64_t shard_id = 0; shard_id < smp::count && offset < size; ++shard_id) {
             uint64_t chunk_size = 0;
             if (offset + buffer_size <= size) {
                 chunk_size = buffer_size;
             } else {
                 chunk_size = size - offset;
                 chunk_size = chunk_size / record_size * record_size;
-                if (chunk_size == 0)
+                if (chunk_size == 0) {
+                    // Incomplete record at the end of the file, ignore it.
+                    offset = size;
                     break;
+                }
             }
 
-            next_iteration_futures.push_back(
+            futures_in_iteration.push_back(
                 smp::submit_to(shard_id, smp_submit_to_options(), [filename, offset, chunk_size] {
                         return read_and_sort(filename, offset, chunk_size);
                     }));
             offset += chunk_size;
-        } 
-        futures.push_back(when_all_succeed(std::move(next_iteration_futures)));
+        }
+        if (!futures_in_iteration.empty())
+            futures.push_back(when_all_succeed(std::move(futures_in_iteration)));
     }
     return when_all_succeed(std::move(futures));
 }
 
-future<std::vector<std::vector<sstring>>> external_merge(sstring filename, uint64_t size, uint64_t max_buffer_size, uint64_t min_buffer_size) {
+future<std::vector<std::vector<sstring>>> external_merge_sort(sstring filename, uint64_t size, uint64_t max_buffer_size, uint64_t min_buffer_size) {
     fmt::print("filename {} size {} max_buffer_size {} min_buffer_size {}\n", filename, size, max_buffer_size, min_buffer_size);
 
     uint64_t record_count = size / record_size; 
     uint64_t record_count_per_shard = record_count / smp::count + (record_count % smp::count ? 1 : 0);
     uint64_t byte_count_per_shard = std::max(record_count_per_shard * record_size, min_buffer_size); 
     if (byte_count_per_shard <= max_buffer_size) {
+        // One run on the avaialble shards will suffice
         return futures_for_initial_sort(filename, size, byte_count_per_shard);
     } else {
+        // Multiple runs on the available nodes are needed
         return futures_for_initial_sort(filename, size, max_buffer_size);
     }
 }
@@ -155,13 +161,14 @@ future<> f() {
     //         return demo_with_file("/home/attilaj/dummy/data.txt");
     //     });
  
-    sstring filename = "/home/attilaj/dummy/data.txt";
+    // sstring filename = "/home/attilaj/dummy/data.txt";
+    sstring filename = "/home/attilaj/dummy/data-big.txt";
 
     // TODO: uncomment these
-    // uint64_t max_buffer_size = 1UL << 30; // 1G
-    // uint64_t min_buffer_size = 1UL << 20; // 1M
-    uint64_t max_buffer_size = 4096UL;
-    uint64_t min_buffer_size = 4096UL;
+    uint64_t max_buffer_size = 1UL << 30; // 1G
+    uint64_t min_buffer_size = 1UL << 20; // 1M
+    // uint64_t max_buffer_size = 4096UL;
+    // uint64_t min_buffer_size = 4096UL;
 
     return when_all_succeed(
             file_size(filename),
@@ -170,7 +177,9 @@ future<> f() {
         ).then_unpack([filename, max_buffer_size, min_buffer_size] (uint64_t size, bool accessible) {
             if (!accessible)
                 throw std::runtime_error(filename + " file is not accessible");
-            return external_merge(filename, size, max_buffer_size, min_buffer_size);
+            if (size < record_size)
+                throw std::runtime_error(filename + " file doesn't contain a full record");
+            return external_merge_sort(filename, size, max_buffer_size, min_buffer_size);
         }).then([](std::vector<std::vector<sstring>> fn_vectors){
             for (const auto& fn_vec: fn_vectors)
                 for (const auto& fn: fn_vec)
