@@ -73,9 +73,11 @@ future<sstring> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_
     auto rbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
     return do_with(std::move(rbuf), [filename, offset, chunk_size](auto &rbuf) {
             return read_file(filename, rbuf, offset, chunk_size).then([&rbuf, chunk_size] {
-                    record_type *record_buffer = reinterpret_cast<record_type*>(rbuf.get_write());
-                    std::sort(record_buffer,
-                        record_buffer + chunk_size / record_size);
+                    return async([&rbuf, chunk_size] {
+                            record_type *record_buffer = reinterpret_cast<record_type*>(rbuf.get_write());
+                            std::sort(record_buffer,
+                                record_buffer + chunk_size / record_size);
+                        });
                 }).then([filename, offset, chunk_size, &rbuf] {
                     std::ostringstream os;
                     os << filename << "-" << offset << "-" << this_shard_id();
