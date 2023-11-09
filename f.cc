@@ -74,6 +74,8 @@ future<sstring> read_and_sort(sstring filename, uint64_t offset, uint64_t chunk_
     return do_with(std::move(rbuf), [filename, offset, chunk_size](auto &rbuf) {
             return read_file(filename, rbuf, offset, chunk_size).then([&rbuf, chunk_size] {
                     return async([&rbuf, chunk_size] {
+                            // sorting will stall the event log
+                            // this is ok as there are no i/o events here to take care of.
                             record_type *record_buffer = reinterpret_cast<record_type*>(rbuf.get_write());
                             std::sort(record_buffer,
                                 record_buffer + chunk_size / record_size);
@@ -167,7 +169,7 @@ future<> f() {
     sstring filename = "/home/attilaj/dummy/data-big.txt";
 
     // TODO: uncomment these
-    uint64_t max_buffer_size = 1UL << 30; // 1G
+    uint64_t max_buffer_size = 512 * (1UL << 20); // 512M
     uint64_t min_buffer_size = 1UL << 20; // 1M
     // uint64_t max_buffer_size = 4096UL;
     // uint64_t min_buffer_size = 4096UL;
