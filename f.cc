@@ -105,7 +105,7 @@ future<std::vector<std::vector<sstring>>> futures_for_initial_sort(sstring filen
                 chunk_size = size - offset;
                 chunk_size = chunk_size / record_size * record_size;
                 if (chunk_size == 0) {
-                    // Incomplete record at the end of the file, ignore it.
+                    // Incomplete record at the end of the file, skip it and jump to the end.
                     offset = size;
                     break;
                 }
@@ -123,19 +123,60 @@ future<std::vector<std::vector<sstring>>> futures_for_initial_sort(sstring filen
     return when_all_succeed(std::move(futures));
 }
 
+
+future<> futures_for_merge(sstring filename1, sstring filename2, sstring out_filename) {
+    open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
+    return with_file(open_file_dma(filename1, open_flags::ro), [filename2, out_filename] (file& f1) {
+            return with_file(open_file_dma(filename2, open_flags::ro), [&f1, out_filename] (file& f2) {
+                return with_file(open_file_dma(out_filename, open_flags::ro), [&f1, &f2] (file& fout) {
+                        return async([&f1, &f2, &fout] {
+                                auto rbuf1 = temporary_buffer<char>::aligned(aligned_size, record_size);
+                                auto rbuf2 = temporary_buffer<char>::aligned(aligned_size, record_size);
+                                size_t off1 = 0;
+                                size_t off2 = 0;
+                                size_t out_off = 0;
+                                future<size_t> read1 = f1.dma_read(off1, rbuf1.get_write(), record_size);
+                                future<size_t> read2 = f2.dma_read(off2, rbuf2.get_write(), record_size);
+                                auto [cnt1, cnt2] = when_all_succeed(std::move(read1), std::move(read2)).get();
+                                while (cnt1 == record_size && cnt2 == record_size) {
+                                    int cmp = strncmp(rbuf1.get(), rbuf2.get(), record_size);
+                                    if (cmp < 0) {
+                                        off1 += record_size;
+                                        future<size_t> read1 = f1.dma_read(off1, rbuf1.get_write(), record_size);
+                                        future<size_t> write1 = fout.dma_write(out_off, rbuf1.get(), record_size);
+                                        auto [wcnt1, rcnt1] = when_all_succeed(std::move(write1), std::move(read1)).get();
+                                        assert(wcnt1 == record_size);
+                                        out_off += wcnt1;
+                                        cnt1 = rcnt1;
+                                    } else if (cmp > 0) {
+                                        off2 += record_size;
+                                        future<size_t> read2 = f2.dma_read(off2, rbuf2.get_write(), record_size);
+                                        future<size_t> write2 = fout.dma_write(out_off, rbuf2.get(), record_size);
+                                        auto [wcnt2, rcnt2] = when_all_succeed(std::move(write2), std::move(read2)).get();
+                                        assert(wcnt2 == record_size);
+                                        out_off += wcnt2;
+                                        cnt2 = rcnt2;
+                                    }
+                                }
+                            });
+                    });
+                });
+        });
+}
+
 future<std::vector<std::vector<sstring>>> external_merge_sort(sstring filename, uint64_t size, uint64_t max_buffer_size, uint64_t min_buffer_size) {
     fmt::print("filename {} size {} max_buffer_size {} min_buffer_size {}\n", filename, size, max_buffer_size, min_buffer_size);
 
     uint64_t record_count = size / record_size; 
     uint64_t record_count_per_shard = record_count / smp::count + (record_count % smp::count ? 1 : 0);
     uint64_t byte_count_per_shard = std::max(record_count_per_shard * record_size, min_buffer_size); 
-    if (byte_count_per_shard <= max_buffer_size) {
-        // One run on the avaialble shards will suffice
-        return futures_for_initial_sort(filename, size, byte_count_per_shard);
-    } else {
-        // Multiple runs on the available nodes are needed
-        return futures_for_initial_sort(filename, size, max_buffer_size);
-    }
+
+    future<std::vector<std::vector<sstring>>> initial_sort =
+        (byte_count_per_shard <= max_buffer_size) ?
+            futures_for_initial_sort(filename, size, byte_count_per_shard) :
+            futures_for_initial_sort(filename, size, max_buffer_size);
+
+    return initial_sort;
 }
 
 future<> check_params(uint64_t max_buffer_size, uint64_t min_buffer_size) {
@@ -169,8 +210,8 @@ future<> f() {
     sstring filename = "/home/attilaj/dummy/data-big.txt";
 
     // TODO: uncomment these
-    uint64_t max_buffer_size = 512 * (1UL << 20); // 512M
-    uint64_t min_buffer_size = 1UL << 20; // 1M
+    uint64_t max_buffer_size = 100 * (1UL << 20); // 100M
+    uint64_t min_buffer_size = 1UL << 19; // 512K
     // uint64_t max_buffer_size = 4096UL;
     // uint64_t min_buffer_size = 4096UL;
 
