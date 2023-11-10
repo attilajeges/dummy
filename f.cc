@@ -80,31 +80,6 @@ future<> write_file(sstring filename, temporary_buffer<char>& wbuf, uint64_t siz
     });
 }
 
-int partition(std::vector<const Record*> &records, size_t begin, size_t end) {
-    const Record *pivot = records[begin];
-    size_t i = begin;
-
-    for (size_t j = begin + 1; j < end; j++) {
-        if (*records[j] <= *pivot) {
-            i++;
-            std::swap(records[i], records[j]);
-        }
-    }
-
-    std::swap(records[i], records[begin]);
-    thread::yield();
-    return i;
-}
-
-void qsort(std::vector<const Record*> &records, size_t begin, size_t end) {
-    if (begin < end) {
-        size_t r = partition(records, begin, end);
-        qsort(records, begin, r);  
-        qsort(records, r + 1, end);
-    }
-}
-
-
 future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chunk_size) {
     LOG.info("Reading and sorting {} range [{}, {})", filename, offset, offset + chunk_size);
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
@@ -118,16 +93,24 @@ future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chun
                            for (const Record *r = begin; r < end; ++r) {
                                records.push_back(r);
                            }
-													 // qsort(records, 0, records.size());
                            std::sort(records.begin(), records.end(),
                                [](const Record *p1, const Record *p2) {
                                    return *p1 < *p2;
                                });
+                           return records;
                         });
-                }).then([offset, chunk_size, &rwbuf] {
+                }).then([offset, chunk_size, &rwbuf](std::vector<const Record*> records) {
+                    open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
                     sstring out_fn = get_filename("sort");
-                    return write_file(out_fn, rwbuf, chunk_size).then([out_fn] {
-                            return out_fn;
+                    return with_file(open_file_dma(out_fn, wflags), [out_fn, records=std::move(records)] (file& fout) {
+                            return async([&fout, out_fn, records=std::move(records)] {
+                                    size_t out_off = 0;
+                                    for (const Record *r: records) {
+                                        fout.dma_write(out_off, r->get(), record_size).get();
+                                        out_off += record_size;
+                                    }
+                                    return out_fn;
+                                });
                         });
                 });
         });
