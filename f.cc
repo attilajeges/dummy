@@ -33,11 +33,7 @@ public:
       return *this;
     }
 
-    bool operator<(const Record& other) const {
-        return cmp(other) < 0;
-    }
-
-    std::strong_ordering cmp(const Record& other) const {
+    std::strong_ordering operator<=>(const Record& other) const {
         return std::lexicographical_compare_three_way(
             _buf, _buf + record_size,
             other._buf, other._buf + record_size);
@@ -96,14 +92,15 @@ void qsort(std::vector<const Record*> &records, size_t begin, size_t end) {
 }
 
 
-future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chunk_size) {
+future<sstring> read_sort_write(size_t shard_id, sstring filename, uint64_t offset, uint64_t chunk_size) {
+    fmt::print("--- Reading and sorting {} range [{}, {}) on shard {}\n", filename, offset, chunk_size, shard_id);
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
     return do_with(std::move(rwbuf), [filename, offset, chunk_size](auto &rwbuf) {
             return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf, chunk_size] {
                     return async([&rwbuf, chunk_size] {
                            const Record *begin = Record::ptr_to_temp_buffer(rwbuf);
                            const Record *end = begin + chunk_size / record_size;
-                           std::vector<const Record *p> records;
+                           std::vector<const Record*> records;
                            records.reserve(end - begin);
                            for (const Record *r = begin; r < end; ++r) {
                                records.push_back(r);
@@ -114,7 +111,6 @@ future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chun
                     std::ostringstream os;
                     os << filename << "-" << offset << "-" << this_shard_id();
                     sstring out_filename{os.str()};
-                    fmt::print("out_filename {} \n", out_filename);
                     return write_file(os.str(), rwbuf, chunk_size).then([out_filename] {
                             return out_filename;
                         });
@@ -124,7 +120,8 @@ future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chun
 
 
 
-future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filename) {
+future<> merge_and_write(size_t shard_id, sstring filename1, sstring filename2, sstring out_filename) {
+    fmt::print("--- Merging {} and {} on shard {}\n", filename1, filename2, shard_id);
     return with_file(open_file_dma(filename1, open_flags::ro), [filename2, out_filename] (file& f1) {
             return with_file(open_file_dma(filename2, open_flags::ro), [&f1, out_filename] (file& f2) {
                 open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
@@ -143,39 +140,36 @@ future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filen
                                 Record *rec2 = Record::ptr_to_temp_buffer(rbuf2);
 
                                 while (cnt1 == record_size && cnt2 == record_size) {
-                                    auto cmp = rec1->cmp(*rec2);
+                                    auto cmp = rec1 <=> rec2;
 
                                     if (cmp < 0) {
                                         Record rec1_cp{*rec1};
                                         off1 += record_size;
-                                        future<size_t> read1 = f1.dma_read(off1, rec1->get(), record_size);
+                                        future<size_t> read1 = f1.dma_read(off1, rec1->getw(), record_size);
                                         future<size_t> write1 = fout.dma_write(out_off, rec1_cp.get(), record_size);
                                         auto [wcnt1, rcnt1] = when_all_succeed(std::move(write1), std::move(read1)).get();
-                                        assert(wcnt1 == record_size);
                                         out_off += wcnt1;
                                         cnt1 = rcnt1;
                                     } else if (cmp > 0) {
                                         Record rec2_cp{*rec2};
                                         off2 += record_size;
-                                        future<size_t> read2 = f2.dma_read(off2, rec2->get(), record_size);
+                                        future<size_t> read2 = f2.dma_read(off2, rec2->getw(), record_size);
                                         future<size_t> write2 = fout.dma_write(out_off, rec2_cp.get(), record_size);
                                         auto [wcnt2, rcnt2] = when_all_succeed(std::move(write2), std::move(read2)).get();
-                                        assert(wcnt2 == record_size);
                                         out_off += wcnt2;
                                         cnt2 = rcnt2;
                                     } else {
                                         Record rec1_cp[] = {*rec1, *rec1};
                                         off1 += record_size;
-                                        future<size_t> read1 = f1.dma_read(off1, rec1->get(), record_size);
+                                        future<size_t> read1 = f1.dma_read(off1, rec1->getw(), record_size);
                                         off2 += record_size;
-                                        future<size_t> read2 = f2.dma_read(off2, rec2->get(), record_size);
+                                        future<size_t> read2 = f2.dma_read(off2, rec2->getw(), record_size);
 
                                         future<size_t> write1 = fout.dma_write(out_off, rec1_cp[0].get(), 2 * record_size);
                                         auto [wcnt1, rcnt1, rcnt2] = when_all_succeed(
                                                 std::move(write1),
                                                 std::move(read1),
                                                 std::move(read2)).get();
-                                        assert(wcnt1 == 2 * record_size);
                                         out_off += wcnt1;
                                         cnt1 = rcnt1;
                                         cnt2 = rcnt2;
@@ -185,10 +179,9 @@ future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filen
                                 while (cnt1 == record_size) {
                                     Record rec1_cp{*rec1};
                                     off1 += record_size;
-                                    future<size_t> read1 = f1.dma_read(off1, rec1->get(), record_size);
+                                    future<size_t> read1 = f1.dma_read(off1, rec1->getw(), record_size);
                                     future<size_t> write1 = fout.dma_write(out_off, rec1_cp.get(), record_size);
                                     auto [wcnt1, rcnt1] = when_all_succeed(std::move(write1), std::move(read1)).get();
-                                    assert(wcnt1 == record_size);
                                     out_off += wcnt1;
                                     cnt1 = rcnt1;
                                 }
@@ -197,10 +190,9 @@ future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filen
                                while (cnt2 == record_size) {
                                     Record rec2_cp{*rec2};
                                     off2 += record_size;
-                                    future<size_t> read2 = f2.dma_read(off2, rec2->get(), record_size);
+                                    future<size_t> read2 = f2.dma_read(off2, rec2->getw(), record_size);
                                     future<size_t> write2 = fout.dma_write(out_off, rec2_cp.get(), record_size);
                                     auto [wcnt2, rcnt2] = when_all_succeed(std::move(write2), std::move(read2)).get();
-                                    assert(wcnt2 == record_size);
                                     out_off += wcnt2;
                                     cnt2 = rcnt2;
                                 }
@@ -251,7 +243,7 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
         size_t shard_id = 0;
         size_t i = 0;
 
-        auto clear_futures = [&futures, &merge_queue, &shard_id]() mutable {
+        auto resolve_futures = [&futures, &merge_queue, &shard_id]() mutable {
             if (!futures.empty()) {
                 std::vector<sstring> fnames = when_all_succeed(std::move(futures)).get();
                 shard_id = 0;
@@ -262,34 +254,30 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
             }
         };
 
-        auto clear_futures_when_full = [&futures, &clear_futures]() {
-            fmt::print("clear_futures_when_full f {}\n", futures.size());
+        auto resolve_futures_when_all_shards_taken = [&futures, &resolve_futures]() {
             if (futures.size() == smp::count) {
-                return clear_futures();
+                return resolve_futures();
             }
         };
 
         while (i < sort_tasks.size()) {
-            fmt::print("i: {}\n", i);
             const SortTask &task = sort_tasks[i++];
+            shard_id++;
             futures.push_back(
-                smp::submit_to(shard_id++, smp_submit_to_options(), [task] {
-                        fmt::print("fn {} off {} cs {}\n", task._fn, task._off, task._chunk_size);
-                        return read_sort_write(task._fn, task._off, task._chunk_size);
+                smp::submit_to(shard_id, smp_submit_to_options(), [shard_id, task] {
+                        return read_sort_write(shard_id, task._fn, task._off, task._chunk_size);
                     }));
 
-            clear_futures_when_full();
+            resolve_futures_when_all_shards_taken();
         }
 
         while (1) {
-            fmt::print("mq: {}\n", merge_queue.size());
             if (merge_queue.size() <= 1)
-                clear_futures();
+                resolve_futures();
             if (merge_queue.size() == 1)
               return merge_queue.front();
     
             while (merge_queue.size() > 1) {
-                fmt::print("mq2: {}\n", merge_queue.size());
                 sstring fn1 = merge_queue.front();
                 merge_queue.pop_front();
     
@@ -300,14 +288,15 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
                 os << fn1 << "-" << fn2 << "-" << shard_id;
                 sstring out_fn = os.str();
     
+                shard_id++;
                 futures.push_back(
-                    smp::submit_to(shard_id++, smp_submit_to_options(), [fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
-                            return merge_and_write(fn1, fn2, out_fn).then([out_fn] {
+                    smp::submit_to(shard_id, smp_submit_to_options(), [shard_id, fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
+                            return merge_and_write(shard_id, fn1, fn2, out_fn).then([out_fn] {
                                     return out_fn;
                                 });
                         }));
     
-                clear_futures_when_full();
+                resolve_futures_when_all_shards_taken();
             }
         }
         throw std::runtime_error("Unexpected failure");
@@ -355,9 +344,9 @@ future<> f() {
 
             return external_merge_sort(filename, size, buffer_size);
         }).then([](sstring fn){
-            fmt::print("Created filename: {}\n", fn);
+            fmt::print("--- Created sorted file: {}\n", fn);
         }).handle_exception([] (std::exception_ptr e) {
-            std::cout << "Exception: " << e << "\n";
+            fmt::print("--- Exception: {}\n", e);
         });
 }
 
