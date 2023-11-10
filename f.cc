@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <compare>
 #include <deque>
 #include <vector>
@@ -52,6 +53,15 @@ public:
 private:
     char _buf[record_size];
 };
+
+sstring get_filename(std::string_view prefix) {
+    const auto p1 = std::chrono::system_clock::now();
+    std::ostringstream os;
+    os << prefix << "-"
+       << std::chrono::duration_cast<std::chrono::nanoseconds>(p1.time_since_epoch()).count() << "-"
+       << this_shard_id();
+    return os.str();
+}
 
 future<> read_chunk(sstring filename, temporary_buffer<char>& rbuf, uint64_t offset, uint64_t chunk_size) {
     return with_file(open_file_dma(filename, open_flags::ro), [&rbuf, offset, chunk_size] (file& f) {
@@ -114,12 +124,10 @@ future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chun
                                    return *p1 < *p2;
                                });
                         });
-                }).then([filename, offset, chunk_size, &rwbuf] {
-                    std::ostringstream os;
-                    os << filename << "-" << offset << "-" << this_shard_id();
-                    sstring out_filename{os.str()};
-                    return write_file(os.str(), rwbuf, chunk_size).then([out_filename] {
-                            return out_filename;
+                }).then([offset, chunk_size, &rwbuf] {
+                    sstring out_fn = get_filename("sort");
+                    return write_file(out_fn, rwbuf, chunk_size).then([out_fn] {
+                            return out_fn;
                         });
                 });
         });
@@ -127,13 +135,14 @@ future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chun
 
 
 
-future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filename) {
+future<sstring> merge_and_write(sstring filename1, sstring filename2) {
     LOG.info("Merging {} and {}", filename1, filename2);
-    return with_file(open_file_dma(filename1, open_flags::ro), [filename2, out_filename] (file& f1) {
-            return with_file(open_file_dma(filename2, open_flags::ro), [&f1, out_filename] (file& f2) {
+    return with_file(open_file_dma(filename1, open_flags::ro), [filename2] (file& f1) {
+            return with_file(open_file_dma(filename2, open_flags::ro), [&f1] (file& f2) {
                 open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
-                return with_file(open_file_dma(out_filename, wflags), [&f1, &f2] (file& fout) {
-                        return async([&f1, &f2, &fout] {
+                sstring out_fn = get_filename("merge");
+                return with_file(open_file_dma(out_fn, wflags), [&f1, &f2, out_fn] (file& fout) {
+                        return async([&f1, &f2, &fout, out_fn] {
                                 auto rbuf1 = temporary_buffer<char>::aligned(aligned_size, record_size);
                                 auto rbuf2 = temporary_buffer<char>::aligned(aligned_size, record_size);
                                 size_t off1 = 0;
@@ -203,6 +212,8 @@ future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filen
                                     out_off += wcnt2;
                                     cnt2 = rcnt2;
                                 }
+
+                                return out_fn;
                             });
                     });
                 });
@@ -289,15 +300,9 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
                 sstring fn2 = merge_queue.front();
                 merge_queue.pop_front();
     
-                std::ostringstream os;
-                os << fn1 << "-" << fn2 << "-" << shard_id;
-                sstring out_fn = os.str();
-    
                 futures.push_back(
-                    smp::submit_to(shard_id++, smp_submit_to_options(), [fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
-                            return merge_and_write(fn1, fn2, out_fn).then([out_fn] {
-                                    return out_fn;
-                                });
+                    smp::submit_to(shard_id++, smp_submit_to_options(), [fn1=std::move(fn1), fn2=std::move(fn2)] {
+                            return merge_and_write(fn1, fn2);
                         }));
     
                 resolve_futures_when_all_shards_taken();
@@ -323,14 +328,14 @@ future<> check_params(uint64_t max_buffer_size, uint64_t min_buffer_size) {
 }
 
 future<> f() {
-    // sstring filename = "data-big.txt";
-    sstring filename = "data.txt";
+    sstring filename = "data-big.txt";
+    // sstring filename = "data.txt";
 
     // TODO: uncomment these
-    // uint64_t max_buffer_size = 1UL << 30; // 1G
-    // uint64_t min_buffer_size = 1UL << 20; // 1M
-    uint64_t max_buffer_size = 4096UL;
-    uint64_t min_buffer_size = 4096UL;
+    uint64_t max_buffer_size = 1UL << 30; // 1G
+    uint64_t min_buffer_size = 1UL << 20; // 1M
+    // uint64_t max_buffer_size = 4096UL;
+    // uint64_t min_buffer_size = 4096UL;
 
     return when_all_succeed(
             file_size(filename),
