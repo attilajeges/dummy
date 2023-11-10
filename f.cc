@@ -43,9 +43,8 @@ public:
             other._buf, other._buf + record_size);
     }
 
-    char *get() {
-        return _buf;
-    }
+    const char *get() const { return _buf; }
+    char *getw() { return _buf; }
 
     static Record *ptr_to_temp_buffer(temporary_buffer<char> &buf) {
         return reinterpret_cast<Record*>(buf.get_write());
@@ -63,33 +62,60 @@ future<> read_chunk(sstring filename, temporary_buffer<char>& rbuf, uint64_t off
     });
 }
 
-future<> write_file(sstring filename, temporary_buffer<char>& rbuf, uint64_t size) {
+future<> write_file(sstring filename, temporary_buffer<char>& wbuf, uint64_t size) {
     open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
-    return with_file(open_file_dma(filename, wflags), [&rbuf, size] (file& f) {
-        return f.dma_write(0, rbuf.get(), size).then([&rbuf, size] (size_t count) {
+    return with_file(open_file_dma(filename, wflags), [&wbuf, size] (file& f) {
+        return f.dma_write(0, wbuf.get(), size).then([&wbuf, size] (size_t count) {
             assert(count == size);
         });
     });
 }
 
+int partition(std::vector<const Record*> &records, size_t begin, size_t end) {
+    const Record *pivot = records[begin];
+    size_t i = begin;
+
+    for (size_t j = begin + 1; j < end; j++) {
+        if (*records[j] <= *pivot) {
+            i++;
+            std::swap(records[i], records[j]);
+        }
+    }
+
+    std::swap(records[i], records[begin]);
+    return i;
+}
+
+void qsort(std::vector<const Record*> &records, size_t begin, size_t end) {
+    if (begin < end) {
+        size_t r = partition(records, begin, end);
+        thread::yield();
+        qsort(records, begin, r);  
+        qsort(records, r + 1, end);
+    }
+}
+
+
 future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chunk_size) {
-    auto rbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
-    return do_with(std::move(rbuf), [filename, offset, chunk_size](auto &rbuf) {
-            return read_chunk(filename, rbuf, offset, chunk_size).then([&rbuf, chunk_size] {
-                    return async([&rbuf, chunk_size] {
-                            // TODO: fixme
-                            // sorting will stall the event log
-                            // this is ok as there are no i/o events here to take care of.
-                            Record *record_buffer = Record::ptr_to_temp_buffer(rbuf);
-                            std::sort(record_buffer,
-                                record_buffer + chunk_size / record_size);
+    auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
+    return do_with(std::move(rwbuf), [filename, offset, chunk_size](auto &rwbuf) {
+            return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf, chunk_size] {
+                    return async([&rwbuf, chunk_size] {
+                           const Record *begin = Record::ptr_to_temp_buffer(rwbuf);
+                           const Record *end = begin + chunk_size / record_size;
+                           std::vector<const Record *p> records;
+                           records.reserve(end - begin);
+                           for (const Record *r = begin; r < end; ++r) {
+                               records.push_back(r);
+                           }
+													 qsort(records, 0, records.size());
                         });
-                }).then([filename, offset, chunk_size, &rbuf] {
+                }).then([filename, offset, chunk_size, &rwbuf] {
                     std::ostringstream os;
                     os << filename << "-" << offset << "-" << this_shard_id();
                     sstring out_filename{os.str()};
                     fmt::print("out_filename {} \n", out_filename);
-                    return write_file(os.str(), rbuf, chunk_size).then([out_filename] {
+                    return write_file(os.str(), rwbuf, chunk_size).then([out_filename] {
                             return out_filename;
                         });
                 });
@@ -138,16 +164,19 @@ future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filen
                                         out_off += wcnt2;
                                         cnt2 = rcnt2;
                                     } else {
-                                        Record rec1_cp{*rec1};
+                                        Record rec1_cp[] = {*rec1, *rec1};
                                         off1 += record_size;
                                         future<size_t> read1 = f1.dma_read(off1, rec1->get(), record_size);
                                         off2 += record_size;
                                         future<size_t> read2 = f2.dma_read(off2, rec2->get(), record_size);
-                                        future<size_t> write1 = fout.dma_write(out_off, rec1_cp.get(), record_size);
-                                        future<size_t> write2 = fout.dma_write(out_off, rec1_cp.get(), record_size);
-                                        auto [wcnt1, wcnt2, rcnt1, rcnt2] = when_all_succeed(std::move(write1), std::move(write2), std::move(read1), std::move(read2)).get();
-                                        assert(wcnt1 == record_size && wcnt2 == record_size);
-                                        out_off += wcnt1 + wcnt2;
+
+                                        future<size_t> write1 = fout.dma_write(out_off, rec1_cp[0].get(), 2 * record_size);
+                                        auto [wcnt1, rcnt1, rcnt2] = when_all_succeed(
+                                                std::move(write1),
+                                                std::move(read1),
+                                                std::move(read2)).get();
+                                        assert(wcnt1 == 2 * record_size);
+                                        out_off += wcnt1;
                                         cnt1 = rcnt1;
                                         cnt2 = rcnt2;
                                     }
@@ -202,8 +231,7 @@ std::vector<SortTask> get_sort_tasks(sstring filename, uint64_t size, uint64_t b
             chunk_size = size - offset;
             chunk_size = chunk_size / record_size * record_size;
             if (chunk_size == 0) {
-                // Incomplete record at the end of the file, skip it and jump to the end.
-                offset = size;
+                // Incomplete record at the end of the file, ignore it.
                 break;
             }
         }
@@ -222,8 +250,9 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
         std::vector<future<sstring>> futures;
         size_t shard_id = 0;
         size_t i = 0;
-        while (i < sort_tasks.size()) {
-            if (shard_id == smp::count) {
+
+        auto clear_futures = [&futures, &merge_queue, &shard_id]() mutable {
+            if (!futures.empty()) {
                 std::vector<sstring> fnames = when_all_succeed(std::move(futures)).get();
                 shard_id = 0;
                 futures.clear();
@@ -231,59 +260,56 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
                     merge_queue.emplace_back(fn);
                 }
             }
+        };
 
+        auto clear_futures_when_full = [&futures, &clear_futures]() {
+            fmt::print("clear_futures_when_full f {}\n", futures.size());
+            if (futures.size() == smp::count) {
+                return clear_futures();
+            }
+        };
+
+        while (i < sort_tasks.size()) {
+            fmt::print("i: {}\n", i);
             const SortTask &task = sort_tasks[i++];
             futures.push_back(
                 smp::submit_to(shard_id++, smp_submit_to_options(), [task] {
+                        fmt::print("fn {} off {} cs {}\n", task._fn, task._off, task._chunk_size);
                         return read_sort_write(task._fn, task._off, task._chunk_size);
                     }));
+
+            clear_futures_when_full();
         }
 
-        if (shard_id == smp::count) {
-            std::vector<sstring> fnames = when_all_succeed(std::move(futures)).get();
-            shard_id = 0;
-            futures.clear();
-            for (const sstring &fn: fnames) {
-                merge_queue.emplace_back(fn);
+        while (1) {
+            fmt::print("mq: {}\n", merge_queue.size());
+            if (merge_queue.size() <= 1)
+                clear_futures();
+            if (merge_queue.size() == 1)
+              return merge_queue.front();
+    
+            while (merge_queue.size() > 1) {
+                fmt::print("mq2: {}\n", merge_queue.size());
+                sstring fn1 = merge_queue.front();
+                merge_queue.pop_front();
+    
+                sstring fn2 = merge_queue.front();
+                merge_queue.pop_front();
+    
+                std::ostringstream os;
+                os << fn1 << "-" << fn2 << "-" << shard_id;
+                sstring out_fn = os.str();
+    
+                futures.push_back(
+                    smp::submit_to(shard_id++, smp_submit_to_options(), [fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
+                            return merge_and_write(fn1, fn2, out_fn).then([out_fn] {
+                                    return out_fn;
+                                });
+                        }));
+    
+                clear_futures_when_full();
             }
         }
-
-        if (!merge_queue.empty()) {
-            while (1) {
-                if (shard_id == smp::count) {
-                    std::vector<sstring> fnames = when_all_succeed(std::move(futures)).get();
-                    shard_id = 0;
-                    futures.clear();
-                    for (const sstring &fn: fnames) {
-                        merge_queue.emplace_back(fn);
-                    }
-                }
-
-                if (merge_queue.size() == 1 && futures.empty()) {
-                    return merge_queue.front();
-                }
-
-                if (merge_queue.size() > 1 && shard_id < smp::count) {
-                    sstring fn1 = merge_queue.front();
-                    merge_queue.pop_front();
-
-                    sstring fn2 = merge_queue.front();
-                    merge_queue.pop_front();
-
-                    std::ostringstream os;
-                    os << fn1 << "-" << fn2 << "-" << shard_id;
-                    sstring out_fn = os.str();
-
-                    futures.push_back(
-                        smp::submit_to(shard_id++, smp_submit_to_options(), [fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
-                                return merge_and_write(fn1, fn2, out_fn).then([out_fn] {
-                                        return out_fn;
-                                    });
-                            }));
-                }
-            }
-        }
-
         throw std::runtime_error("Unexpected failure");
     });
 }
