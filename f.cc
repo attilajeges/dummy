@@ -327,8 +327,8 @@ future<> f() {
             size_t buffer_size = std::min(bytes_per_shard, max_buffer_size);
 
             return external_merge_sort(filename, size, buffer_size);
-        }).then([](sstring fn){
-            std::rename(fn.data(), (fn + ".sorted").data());
+        }).then([filename](sstring fn){
+            std::rename(fn.data(), (filename + ".sorted").data());
             LOG.info("Created sorted file: {}", fn);
         }).handle_exception([] (std::exception_ptr e) {
             LOG.error("Exception: {}", e);
