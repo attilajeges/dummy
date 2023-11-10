@@ -71,15 +71,6 @@ future<> read_chunk(sstring filename, temporary_buffer<char>& rbuf, uint64_t off
     });
 }
 
-future<> write_file(sstring filename, temporary_buffer<char>& wbuf, uint64_t size) {
-    open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
-    return with_file(open_file_dma(filename, wflags), [&wbuf, size] (file& f) {
-        return f.dma_write(0, wbuf.get(), size).then([&wbuf, size] (size_t count) {
-            assert(count == size);
-        });
-    });
-}
-
 future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chunk_size) {
     LOG.info("Reading and sorting {} range [{}, {})", filename, offset, offset + chunk_size);
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
@@ -291,7 +282,7 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
                 resolve_futures_when_all_shards_taken();
             }
         }
-        throw std::runtime_error("Unexpected failure");
+        throw std::logic_error("Unexpected failure");
     });
 }
 
@@ -299,13 +290,13 @@ future<> check_params(uint64_t max_buffer_size, uint64_t min_buffer_size) {
     if (max_buffer_size < min_buffer_size) {
        std::ostringstream os;
        os << "Max buffer size (" << max_buffer_size << ") should be greater than or equal to min buffer size (" << min_buffer_size << ")";
-       throw std::runtime_error(os.str());
+       throw std::invalid_argument(os.str());
     }
 
     if (max_buffer_size % record_size != 0 || min_buffer_size % record_size != 0) {
        std::ostringstream os;
        os << "Max buffer size (" << max_buffer_size << ") and min buffer size (" << min_buffer_size << ") should both be multiplies of record size (" << record_size << ")";
-       throw std::runtime_error(os.str());
+       throw std::invalid_argument(os.str());
     }
     return make_ready_future<>();
 }
