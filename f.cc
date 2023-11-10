@@ -1,26 +1,29 @@
-#include <seastar/core/future.hh>
-#include <iostream>
-#include <vector>
 #include <algorithm>
-#include <deque>
 #include <compare>
+#include <deque>
+#include <vector>
 #include <sstream>
-#include <seastar/core/sharded.hh>
-#include <seastar/core/sstring.hh>
-#include <seastar/core/smp.hh>
-#include <seastar/core/reactor.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/temporary_buffer.hh>
-#include <seastar/util/tmp_file.hh>
+
+#include <seastar/core/future.hh>
+#include <seastar/util/log.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/util/tmp_file.hh>
 #include <seastar/core/when_all.hh>
+
 
 using namespace seastar;
 
 constexpr size_t aligned_size = 4096;
 constexpr size_t record_size = 4096;
 
+static logger LOG("external_merge_sort");
 
 class Record {
 public:
@@ -79,21 +82,21 @@ int partition(std::vector<const Record*> &records, size_t begin, size_t end) {
     }
 
     std::swap(records[i], records[begin]);
+    thread::yield();
     return i;
 }
 
 void qsort(std::vector<const Record*> &records, size_t begin, size_t end) {
     if (begin < end) {
         size_t r = partition(records, begin, end);
-        thread::yield();
         qsort(records, begin, r);  
         qsort(records, r + 1, end);
     }
 }
 
 
-future<sstring> read_sort_write(size_t shard_id, sstring filename, uint64_t offset, uint64_t chunk_size) {
-    fmt::print("--- Reading and sorting {} range [{}, {}) on shard {}\n", filename, offset, chunk_size, shard_id);
+future<sstring> read_sort_write(sstring filename, uint64_t offset, uint64_t chunk_size) {
+    LOG.info("Reading and sorting {} range [{}, {})", filename, offset, offset + chunk_size);
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
     return do_with(std::move(rwbuf), [filename, offset, chunk_size](auto &rwbuf) {
             return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf, chunk_size] {
@@ -105,7 +108,11 @@ future<sstring> read_sort_write(size_t shard_id, sstring filename, uint64_t offs
                            for (const Record *r = begin; r < end; ++r) {
                                records.push_back(r);
                            }
-													 qsort(records, 0, records.size());
+													 // qsort(records, 0, records.size());
+                           std::sort(records.begin(), records.end(),
+                               [](const Record *p1, const Record *p2) {
+                                   return *p1 < *p2;
+                               });
                         });
                 }).then([filename, offset, chunk_size, &rwbuf] {
                     std::ostringstream os;
@@ -120,8 +127,8 @@ future<sstring> read_sort_write(size_t shard_id, sstring filename, uint64_t offs
 
 
 
-future<> merge_and_write(size_t shard_id, sstring filename1, sstring filename2, sstring out_filename) {
-    fmt::print("--- Merging {} and {} on shard {}\n", filename1, filename2, shard_id);
+future<> merge_and_write(sstring filename1, sstring filename2, sstring out_filename) {
+    LOG.info("Merging {} and {}", filename1, filename2);
     return with_file(open_file_dma(filename1, open_flags::ro), [filename2, out_filename] (file& f1) {
             return with_file(open_file_dma(filename2, open_flags::ro), [&f1, out_filename] (file& f2) {
                 open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
@@ -140,7 +147,7 @@ future<> merge_and_write(size_t shard_id, sstring filename1, sstring filename2, 
                                 Record *rec2 = Record::ptr_to_temp_buffer(rbuf2);
 
                                 while (cnt1 == record_size && cnt2 == record_size) {
-                                    auto cmp = rec1 <=> rec2;
+                                    auto cmp = *rec1 <=> *rec2;
 
                                     if (cmp < 0) {
                                         Record rec1_cp{*rec1};
@@ -262,12 +269,10 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
 
         while (i < sort_tasks.size()) {
             const SortTask &task = sort_tasks[i++];
-            shard_id++;
             futures.push_back(
-                smp::submit_to(shard_id, smp_submit_to_options(), [shard_id, task] {
-                        return read_sort_write(shard_id, task._fn, task._off, task._chunk_size);
+                smp::submit_to(shard_id++, smp_submit_to_options(), [task] {
+                        return read_sort_write(task._fn, task._off, task._chunk_size);
                     }));
-
             resolve_futures_when_all_shards_taken();
         }
 
@@ -288,10 +293,9 @@ future<sstring> external_merge_sort(sstring filename, uint64_t size, uint64_t bu
                 os << fn1 << "-" << fn2 << "-" << shard_id;
                 sstring out_fn = os.str();
     
-                shard_id++;
                 futures.push_back(
-                    smp::submit_to(shard_id, smp_submit_to_options(), [shard_id, fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
-                            return merge_and_write(shard_id, fn1, fn2, out_fn).then([out_fn] {
+                    smp::submit_to(shard_id++, smp_submit_to_options(), [fn1=std::move(fn1), fn2=std::move(fn2), out_fn=std::move(out_fn)] {
+                            return merge_and_write(fn1, fn2, out_fn).then([out_fn] {
                                     return out_fn;
                                 });
                         }));
@@ -319,13 +323,14 @@ future<> check_params(uint64_t max_buffer_size, uint64_t min_buffer_size) {
 }
 
 future<> f() {
-    sstring filename = "data-big.txt";
+    // sstring filename = "data-big.txt";
+    sstring filename = "data.txt";
 
     // TODO: uncomment these
-    uint64_t max_buffer_size = 1UL << 30; // 1G
-    uint64_t min_buffer_size = 1UL << 20; // 1M
-    // uint64_t max_buffer_size = 4096UL;
-    // uint64_t min_buffer_size = 4096UL;
+    // uint64_t max_buffer_size = 1UL << 30; // 1G
+    // uint64_t min_buffer_size = 1UL << 20; // 1M
+    uint64_t max_buffer_size = 4096UL;
+    uint64_t min_buffer_size = 4096UL;
 
     return when_all_succeed(
             file_size(filename),
@@ -344,9 +349,9 @@ future<> f() {
 
             return external_merge_sort(filename, size, buffer_size);
         }).then([](sstring fn){
-            fmt::print("--- Created sorted file: {}\n", fn);
+            LOG.info("Created sorted file: {}", fn);
         }).handle_exception([] (std::exception_ptr e) {
-            fmt::print("--- Exception: {}\n", e);
+            LOG.error("Exception: {}", e);
         });
 }
 
