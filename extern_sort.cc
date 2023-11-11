@@ -9,7 +9,6 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
-#include <seastar/util/log.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
@@ -18,9 +17,10 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/util/tmp_file.hh>
-#include <seastar/util/file.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/util/file.hh>
+#include <seastar/util/log.hh>
+#include <seastar/util/tmp_file.hh>
 
 
 using namespace seastar;
@@ -69,16 +69,16 @@ sstring get_filename(std::string_view prefix) {
     return os.str();
 }
 
-future<> read_chunk(sstring filename, temporary_buffer<char>& rbuf, size_t offset, size_t chunk_size) {
-    return with_file(open_file_dma(filename, open_flags::ro), [&rbuf, offset, chunk_size] (file& f) {
+future<> read_chunk(sstring fn, temporary_buffer<char>& rbuf, size_t offset, size_t chunk_size) {
+    return with_file(open_file_dma(fn, open_flags::ro), [&rbuf, offset, chunk_size] (file& f) {
         return f.dma_read(offset, rbuf.get_write(), chunk_size).then([&rbuf, chunk_size] (size_t count) {
             assert(count == chunk_size);
         });
     });
 }
 
-future<output_stream<char>> make_output_stream(std::string_view filename) {
-    return with_file_close_on_failure(open_file_dma(filename, wflags), [] (file f) {
+future<output_stream<char>> make_output_stream(std::string_view fn) {
+    return with_file_close_on_failure(open_file_dma(fn, wflags), [] (file f) {
         return make_file_output_stream(std::move(f), aligned_size);
     });
 }
@@ -103,13 +103,13 @@ std::vector<const Record*> make_records(temporary_buffer<char> &buf) {
     return records;
 }
  
-future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
-		sstring out_fn = get_filename("sort");
-    LOG.info("Sorting {} range [{}, {}) -> {}", filename, offset, offset + chunk_size, out_fn);
+future<sstring> sort_chunk(sstring fn, size_t offset, size_t chunk_size) {
+		sstring fn_out = get_filename("sort");
+    LOG.info("Sorting {} range [{}, {}) -> {}", fn, offset, offset + chunk_size, fn_out);
 
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
-    return do_with(std::move(rwbuf), [filename, offset, chunk_size, out_fn](auto &rwbuf) {
-        return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf] {
+    return do_with(std::move(rwbuf), [fn, offset, chunk_size, fn_out](auto &rwbuf) {
+        return read_chunk(fn, rwbuf, offset, chunk_size).then([&rwbuf] {
             return async([&rwbuf] {
                 std::vector<const Record*> records = make_records(rwbuf);
                 std::sort(records.begin(), records.end(), [](const Record *p1, const Record *p2) {
@@ -117,24 +117,24 @@ future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
                 });
                 return records;
             });
-        }).then([&rwbuf, out_fn](std::vector<const Record*> records) {
-            return async([records=std::move(records), out_fn] {
-                output_stream<char> o = make_output_stream(out_fn).get0();
+        }).then([&rwbuf, fn_out](std::vector<const Record*> records) {
+            return async([records=std::move(records), fn_out] {
+                output_stream<char> o = make_output_stream(fn_out).get0();
                 write_records_to_stream(o, records).get();
-                return out_fn;
+                return fn_out;
             });
         });
     });
 }
 
-future<sstring> merge_sorted_chunks(sstring filename1, sstring filename2) {
-    sstring out_fn = get_filename("merge");
-    LOG.info("Merging {} {} -> {}", filename1, filename2, out_fn);
+future<sstring> merge_sorted_chunks(sstring fn1, sstring fn2) {
+    sstring fn_out = get_filename("merge");
+    LOG.info("Merging {} {} -> {}", fn1, fn2, fn_out);
 
-    return util::with_file_input_stream(filename1.data(), [filename2, out_fn](input_stream<char> &i1) {
-        return util::with_file_input_stream(filename2.data(), [&i1, out_fn](input_stream<char> &i2) {
-            return async([&i1, &i2, out_fn] {
-                output_stream<char> o = make_output_stream(out_fn).get0();
+    return util::with_file_input_stream(fn1.data(), [fn2, fn_out](input_stream<char> &i1) {
+        return util::with_file_input_stream(fn2.data(), [&i1, fn_out](input_stream<char> &i2) {
+            return async([&i1, &i2, fn_out] {
+                output_stream<char> o = make_output_stream(fn_out).get0();
 
                 auto [rbuf1, rbuf2] = when_all_succeed(
                       i1.read_exactly(record_size),
@@ -183,7 +183,7 @@ future<sstring> merge_sorted_chunks(sstring filename1, sstring filename2) {
                 }
 
                 o.close().get();
-                return out_fn;
+                return fn_out;
             });
         });
     });
@@ -198,15 +198,15 @@ struct SortTask {
     size_t _chunk_size;
 };
 
-std::vector<SortTask> get_sort_tasks(size_t size, size_t buffer_size) {
+std::vector<SortTask> get_sort_tasks(size_t fsize, size_t sort_buf_size) {
     std::vector<SortTask> sort_tasks;
     size_t offset = 0;
-    while (offset < size) {
+    while (offset < fsize) {
         size_t chunk_size = 0;
-        if (offset + buffer_size <= size) {
-            chunk_size = buffer_size;
+        if (offset + sort_buf_size <= fsize) {
+            chunk_size = sort_buf_size;
         } else {
-            chunk_size = size - offset;
+            chunk_size = fsize - offset;
             chunk_size = chunk_size / record_size * record_size;
             if (chunk_size == 0) {
                 // Incomplete record at the end of the file, ignore it.
@@ -220,10 +220,10 @@ std::vector<SortTask> get_sort_tasks(size_t size, size_t buffer_size) {
     return sort_tasks;
 }
 
-future<sstring> extern_sort(sstring filename, size_t size, size_t buffer_size) {
-    std::vector<SortTask> sort_tasks = get_sort_tasks(size, buffer_size);
+future<sstring> extern_sort(sstring fn, size_t fsize, size_t sort_buf_size) {
+    std::vector<SortTask> sort_tasks = get_sort_tasks(fsize, sort_buf_size);
 
-    return async([sort_tasks=std::move(sort_tasks), fn=std::move(filename)] {
+    return async([sort_tasks=std::move(sort_tasks), fn=std::move(fn)] {
         std::deque<sstring> merge_queue;
         std::vector<future<sstring>> futures;
         size_t shard_id = 0;
@@ -281,67 +281,49 @@ future<sstring> extern_sort(sstring filename, size_t size, size_t buffer_size) {
     });
 }
 
-future<> check_params(size_t max_buffer_size, size_t min_buffer_size) {
-    if (max_buffer_size < min_buffer_size) {
+future<> check_params(size_t max_sort_buf_size, size_t min_sort_buf_size) {
+    if (max_sort_buf_size < min_sort_buf_size) {
        std::ostringstream os;
-       os << "Max buffer size (" << max_buffer_size
-          << ") should be greater than or equal to min buffer size (" << min_buffer_size << ")";
+       os << "max_sort_buf_size (" << max_sort_buf_size
+          << ") should be greater than or equal to min_sort_buf_size (" << min_sort_buf_size << ")";
        throw std::invalid_argument(os.str());
     }
 
-    if (max_buffer_size % record_size != 0 || min_buffer_size % record_size != 0) {
+    if (max_sort_buf_size % record_size != 0 || min_sort_buf_size % record_size != 0) {
        std::ostringstream os;
-       os << "Max buffer size (" << max_buffer_size
-          << ") and min buffer size (" << min_buffer_size
+       os << "max_sort_buf_size (" << max_sort_buf_size
+          << ") and min_sort_buf_size (" << min_sort_buf_size
           << ") should both be multiplies of record size (" << record_size << ")";
        throw std::invalid_argument(os.str());
     }
     return make_ready_future<>();
 }
 
-future<> run_extern_sort() {
-    sstring filename = "data.txt";
-
-    // TODO: remove this
-    fmt::print("    free memory {}\n", memory::stats().free_memory()); 
-    // return seastar::make_ready_future<>();
-
-    /// size_t max_buffer_size = memory::stats().free_memory() / 3 / 4096 * 4096;
-    /// size_t min_buffer_size = std::min(1UL << 20, max_buffer_size);
-    /// LOG.info("max_buffer_size={} min_buffer_size={}", max_buffer_size, min_buffer_size);
-
-
-    // TODO: uncomment these
-    size_t max_buffer_size = 1UL << 30; // 1G
-    size_t min_buffer_size = 1UL << 20; // 1M
-    // size_t max_buffer_size = 1UL << 20;
-    // size_t min_buffer_size = 1UL << 20;
-    // size_t max_buffer_size = 4096UL;
-    // size_t min_buffer_size = 4096UL;
-
+future<> run_extern_sort(sstring fn, size_t min_sort_buf_size, size_t max_sort_buf_size, bool clean) {
     return when_all_succeed(
-            file_size(filename),
-            file_accessible(filename, access_flags::exists | access_flags::read),
-            check_params(max_buffer_size, min_buffer_size)
-        ).then_unpack([filename, max_buffer_size, min_buffer_size] (size_t size, bool accessible) {
-            if (!accessible)
-                throw std::runtime_error(filename + " file is not accessible");
-            if (size < record_size)
-                throw std::runtime_error(filename + " file doesn't contain a full record");
+        file_size(fn),
+        file_accessible(fn, access_flags::exists | access_flags::read),
+        check_params(max_sort_buf_size, min_sort_buf_size)
+    ).then_unpack([fn, max_sort_buf_size, min_sort_buf_size] (size_t fsize, bool accessible) {
+        if (!accessible)
+            throw std::runtime_error(fn + " file is not accessible");
+        if (fsize < record_size)
+            throw std::runtime_error(fn + " file doesn't contain a full record");
 
-            size_t rec_cnt = size / record_size;
-            size_t rec_cnt_per_shard = rec_cnt / smp::count + (rec_cnt % smp::count ? 1 : 0);
-            size_t bytes_per_shard = std::max(rec_cnt_per_shard * record_size, min_buffer_size);
-            size_t buffer_size = std::min(bytes_per_shard, max_buffer_size);
-
-            return extern_sort(filename, size, buffer_size);
-        }).then([filename](sstring fn){
-            sstring sorted_fn = filename + ".sorted";
-            std::rename(fn.data(), sorted_fn.data());
-            LOG.info("Created sorted file: {}", sorted_fn);
-        }).handle_exception([] (std::exception_ptr e) {
-            LOG.error("Exception: {}", e);
-        });
+        size_t rec_cnt = fsize / record_size;
+        size_t rec_cnt_per_shard = rec_cnt / smp::count + (rec_cnt % smp::count ? 1 : 0);
+        size_t sort_buf_size = std::min(
+              std::max(rec_cnt_per_shard * record_size, min_sort_buf_size),
+              max_sort_buf_size);
+        LOG.info("Using sort_buf_size={}", sort_buf_size);
+        return extern_sort(fn, fsize, sort_buf_size);
+    }).then([fn](sstring fn) {
+        sstring sorted_fn = fn + ".sorted";
+        std::rename(fn.data(), sorted_fn.data());
+        LOG.info("Created sorted file: {}", sorted_fn);
+    }).handle_exception([] (std::exception_ptr e) {
+        LOG.error("Exception: {}", e);
+    });
 }
 
 

@@ -3,12 +3,37 @@
 #include <iostream>
 #include <stdexcept>
 
-extern seastar::future<> run_extern_sort();
+namespace po = boost::program_options;
+
+extern seastar::future<> run_extern_sort(
+      seastar::sstring filename,
+      size_t min_sort_buf_size,
+      size_t max_sort_buf_size,
+      bool clean);
 
 int main(int argc, char** argv) {
     seastar::app_template app;
+
+    app.add_options()
+        ("clean", "remove intermediate files when done")
+        ;
+    app.add_positional_options({
+       {"filename", po::value<seastar::sstring>()->required(),
+        "input data file containing 4096 byte ascii records", 1},
+       {"min_sort_buf_size", po::value<size_t>()->required(),
+        "minimum buffer size (in bytes) used for sorting per shard (must be multiple of 4096)", 1},
+       {"max_sort_buf_size", po::value<size_t>()->required(),
+        "maximum buffer size (in bytes) used for sorting per shard (must be miltiple of 4096)", 1}
+    });
     try {
-        app.run(argc, argv, run_extern_sort);
+        app.run(argc, argv, [&app] {
+            auto &args = app.configuration();
+            return run_extern_sort(
+                 args["filename"].as<seastar::sstring>(),
+                 args["min_sort_buf_size"].as<size_t>(),
+                 args["max_sort_buf_size"].as<size_t>(),
+                 args.count("clean") != 0);
+        });
     } catch(...) {
         std::cerr << "Couldn't start application: "
                   << std::current_exception() << "\n";
