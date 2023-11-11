@@ -281,26 +281,37 @@ future<sstring> concurrent_extern_sort(sstring fn, size_t fsize, size_t sort_buf
     });
 }
 
-future<> check_params(size_t sort_buf_size) {
-    if (sort_buf_size % record_size != 0) {
+future<> check_params(size_t max_sort_buf_size) {
+    if (max_sort_buf_size % record_size != 0) {
        std::ostringstream os;
-       os << "sort_buf_size (" << sort_buf_size
+       os << "max_sort_buf_size (" << max_sort_buf_size
           << ") must be multiple of record size (" << record_size << ")";
        throw std::invalid_argument(os.str());
     }
     return make_ready_future<>();
 }
 
-future<> extern_sort(sstring fn, size_t sort_buf_size, bool clean) {
+size_t calc_sort_buf_size(size_t fsize, size_t max_sort_buf_size) {
+    // Adjust sort_buf_size to evenly spread the load among the required shards 
+    size_t shard_cnt = fsize / max_sort_buf_size + (fsize % max_sort_buf_size ? 1 : 0);
+    size_t sort_buf_size = fsize / shard_cnt + (fsize % shard_cnt ? 1 : 0);
+    sort_buf_size = (sort_buf_size / record_size + (sort_buf_size % record_size ? 1 : 0)) * record_size;
+    sort_buf_size = std::min(sort_buf_size, max_sort_buf_size);
+    return sort_buf_size;
+}
+
+future<> extern_sort(sstring fn, size_t max_sort_buf_size, bool clean) {
     return when_all_succeed(
         file_size(fn),
         file_accessible(fn, access_flags::exists | access_flags::read),
-        check_params(sort_buf_size)
-    ).then_unpack([fn, sort_buf_size] (size_t fsize, bool accessible) {
+        check_params(max_sort_buf_size)
+    ).then_unpack([fn, max_sort_buf_size] (size_t fsize, bool accessible) {
         if (!accessible)
             throw std::runtime_error(fn + " file is not accessible");
         if (fsize < record_size)
             throw std::runtime_error(fn + " file doesn't contain a full record");
+
+        size_t sort_buf_size = calc_sort_buf_size(fsize, max_sort_buf_size);
         LOG.info("Using sort_buf_size={}", sort_buf_size);
         return concurrent_extern_sort(fn, fsize, sort_buf_size);
     }).then([fn](sstring fn_merged) {
