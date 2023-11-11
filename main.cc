@@ -5,11 +5,7 @@
 
 namespace po = boost::program_options;
 
-extern seastar::future<> run_extern_sort(
-      seastar::sstring filename,
-      size_t min_sort_buf_size,
-      size_t max_sort_buf_size,
-      bool clean);
+extern seastar::future<> extern_sort(seastar::sstring filename, size_t sort_buf_size, bool clean);
 
 int main(int argc, char** argv) {
     seastar::app_template app;
@@ -20,18 +16,15 @@ int main(int argc, char** argv) {
     app.add_positional_options({
        {"filename", po::value<seastar::sstring>()->required(),
         "input data file containing 4096 byte ascii records", 1},
-       {"min_sort_buf_size", po::value<size_t>()->required(),
-        "minimum buffer size (in bytes) used for sorting per shard (must be multiple of 4096)", 1},
-       {"max_sort_buf_size", po::value<size_t>()->required(),
-        "maximum buffer size (in bytes) used for sorting per shard (must be miltiple of 4096)", 1}
+       {"sort_buf_size", po::value<size_t>()->required(),
+        "buffer size (in bytes) used for sorting per shard (must be multiple of 4096)", 1}
     });
     try {
         app.run(argc, argv, [&app] {
             auto &args = app.configuration();
-            return run_extern_sort(
+            return extern_sort(
                  args["filename"].as<seastar::sstring>(),
-                 args["min_sort_buf_size"].as<size_t>(),
-                 args["max_sort_buf_size"].as<size_t>(),
+                 args["sort_buf_size"].as<size_t>(),
                  args.count("clean") != 0);
         });
     } catch(...) {

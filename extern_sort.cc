@@ -220,7 +220,7 @@ std::vector<SortTask> get_sort_tasks(size_t fsize, size_t sort_buf_size) {
     return sort_tasks;
 }
 
-future<sstring> extern_sort(sstring fn, size_t fsize, size_t sort_buf_size) {
+future<sstring> concurrent_extern_sort(sstring fn, size_t fsize, size_t sort_buf_size) {
     std::vector<SortTask> sort_tasks = get_sort_tasks(fsize, sort_buf_size);
 
     return async([sort_tasks=std::move(sort_tasks), fn=std::move(fn)] {
@@ -281,46 +281,32 @@ future<sstring> extern_sort(sstring fn, size_t fsize, size_t sort_buf_size) {
     });
 }
 
-future<> check_params(size_t max_sort_buf_size, size_t min_sort_buf_size) {
-    if (max_sort_buf_size < min_sort_buf_size) {
+future<> check_params(size_t sort_buf_size) {
+    if (sort_buf_size % record_size != 0) {
        std::ostringstream os;
-       os << "max_sort_buf_size (" << max_sort_buf_size
-          << ") should be greater than or equal to min_sort_buf_size (" << min_sort_buf_size << ")";
-       throw std::invalid_argument(os.str());
-    }
-
-    if (max_sort_buf_size % record_size != 0 || min_sort_buf_size % record_size != 0) {
-       std::ostringstream os;
-       os << "max_sort_buf_size (" << max_sort_buf_size
-          << ") and min_sort_buf_size (" << min_sort_buf_size
-          << ") should both be multiplies of record size (" << record_size << ")";
+       os << "sort_buf_size (" << sort_buf_size
+          << ") must be multiple of record size (" << record_size << ")";
        throw std::invalid_argument(os.str());
     }
     return make_ready_future<>();
 }
 
-future<> run_extern_sort(sstring fn, size_t min_sort_buf_size, size_t max_sort_buf_size, bool clean) {
+future<> extern_sort(sstring fn, size_t sort_buf_size, bool clean) {
     return when_all_succeed(
         file_size(fn),
         file_accessible(fn, access_flags::exists | access_flags::read),
-        check_params(max_sort_buf_size, min_sort_buf_size)
-    ).then_unpack([fn, max_sort_buf_size, min_sort_buf_size] (size_t fsize, bool accessible) {
+        check_params(sort_buf_size)
+    ).then_unpack([fn, sort_buf_size] (size_t fsize, bool accessible) {
         if (!accessible)
             throw std::runtime_error(fn + " file is not accessible");
         if (fsize < record_size)
             throw std::runtime_error(fn + " file doesn't contain a full record");
-
-        size_t rec_cnt = fsize / record_size;
-        size_t rec_cnt_per_shard = rec_cnt / smp::count + (rec_cnt % smp::count ? 1 : 0);
-        size_t sort_buf_size = std::min(
-              std::max(rec_cnt_per_shard * record_size, min_sort_buf_size),
-              max_sort_buf_size);
         LOG.info("Using sort_buf_size={}", sort_buf_size);
-        return extern_sort(fn, fsize, sort_buf_size);
-    }).then([fn](sstring fn) {
-        sstring sorted_fn = fn + ".sorted";
-        std::rename(fn.data(), sorted_fn.data());
-        LOG.info("Created sorted file: {}", sorted_fn);
+        return concurrent_extern_sort(fn, fsize, sort_buf_size);
+    }).then([fn](sstring fn_merged) {
+        sstring fn_sorted = fn + ".sorted";
+        std::rename(fn_merged.data(), fn_sorted.data());
+        LOG.info("Created sorted file: {}", fn_sorted);
     }).handle_exception([] (std::exception_ptr e) {
         LOG.error("Exception: {}", e);
     });
