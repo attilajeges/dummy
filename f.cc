@@ -6,6 +6,8 @@
 #include <vector>
 #include <sstream>
 
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/memory.hh>
@@ -92,18 +94,26 @@ future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
                                });
                            return records;
                         });
-                }).then([offset, chunk_size, &rwbuf](std::vector<const Record*> records) {
-                    sstring out_fn = get_filename("sort");
-                    return with_file(open_file_dma(out_fn, wflags), [out_fn, records=std::move(records)] (file& fout) {
-                            return async([&fout, out_fn, records=std::move(records)] {
-                                    size_t out_off = 0;
-                                    for (const Record *r: records) {
-                                        fout.dma_write(out_off, r->get(), record_size).get();
-                                        out_off += record_size;
-                                    }
-                                    return out_fn;
-                                });
-                        });
+                }).then([&rwbuf](std::vector<const Record*> records) {
+                    return async([records=std::move(records)] {
+                        auto make_output_stream = [] (std::string_view filename) {
+                            return with_file_close_on_failure(open_file_dma(filename, wflags), [] (file f) {
+                                return make_file_output_stream(std::move(f), aligned_size);
+                            });
+                        };
+                        auto write_to_stream = [] (output_stream<char>& o, const std::vector<const Record*>& records) {
+                            return seastar::do_for_each(records.begin(), records.end(), [&o] (const Record *r) {
+                                return o.write(r->get(), record_size);
+                            }).finally([&o] {
+                                return o.close();
+                            });
+                        };
+    
+                        sstring out_fn = get_filename("sort");
+                        output_stream<char> o = make_output_stream(out_fn).get0();
+                        write_to_stream(o, records).get();
+                        return out_fn;
+                    });
                 });
         });
 }
