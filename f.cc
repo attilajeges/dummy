@@ -136,52 +136,50 @@ future<sstring> merge_sorted_chunks(sstring filename1, sstring filename2) {
             return async([&i1, &i2, out_fn] {
                 output_stream<char> o = make_output_stream(out_fn).get0();
 
-                future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
-                future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
-                auto [rbuf1, rbuf2] = when_all_succeed(std::move(read1), std::move(read2)).get();
+                auto [rbuf1, rbuf2] = when_all_succeed(
+                      i1.read_exactly(record_size),
+                      i2.read_exactly(record_size)).get();
 
                 while (rbuf1.size() == record_size && rbuf2.size() == record_size) {
-                    Record *rec1 = Record::cast(rbuf1);
-                    Record *rec2 = Record::cast(rbuf2);
+                    const Record *rec1 = Record::cast(rbuf1);
+                    const Record *rec2 = Record::cast(rbuf2);
 
                     auto cmp = *rec1 <=> *rec2;
 
                     if (cmp < 0) {
-                        future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
-                        future<> write1 = o.write(rbuf1.get(), record_size);
-                        auto [next_buf] = when_all_succeed(std::move(write1), std::move(read1)).get();
+                        auto [next_buf] = when_all_succeed(
+                              o.write(rec1->get(), record_size),
+                              i1.read_exactly(record_size)).get();
                         rbuf1 = std::move(next_buf);
                     } else if (cmp > 0) {
-                        future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
-                        future<> write2 = o.write(rbuf2.get(), record_size);
-                        auto [next_buf] = when_all_succeed(std::move(write2), std::move(read2)).get();
+                        auto [next_buf] = when_all_succeed(
+                              o.write(rec2->get(), record_size),
+                              i2.read_exactly(record_size)).get();
                         rbuf2 = std::move(next_buf);
                     } else {
-                        future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
-                        future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
-
-                        Record rec_cp[] = {*rec1, *rec1};
-                        future<> write = o.write(rec_cp[0].get(), 2 * record_size);
+                        Record recs[] = {*rec1, *rec2};
                         auto [next_buf1, next_buf2] = when_all_succeed(
-                                std::move(write),
-                                std::move(read1),
-                                std::move(read2)).get();
+                              o.write(recs[0].get(), 2 * record_size),
+                              i1.read_exactly(record_size),
+                              i2.read_exactly(record_size)).get();
                         rbuf1 = std::move(next_buf1);
                         rbuf2 = std::move(next_buf2);
                     }
                 }
 
                 while (rbuf1.size() == record_size) {
-                    future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
-                    future<> write1 = o.write(rbuf1.get(), record_size);
-                    auto [next_buf] = when_all_succeed(std::move(write1), std::move(read1)).get();
+                    const Record *rec1 = Record::cast(rbuf1);
+                    auto [next_buf] = when_all_succeed(
+                          o.write(rec1->get(), record_size),
+                          i1.read_exactly(record_size)).get();
                     rbuf1 = std::move(next_buf);
                 }
                 while (rbuf2.size() == record_size) {
-                   future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
-                   future<> write2 = o.write(rbuf2.get(), record_size);
-                   auto [next_buf] = when_all_succeed(std::move(write2), std::move(read2)).get();
-                   rbuf2 = std::move(next_buf);
+                    const Record *rec2 = Record::cast(rbuf2);
+                    auto [next_buf] = when_all_succeed(
+                          o.write(rec2->get(), record_size),
+                          i2.read_exactly(record_size)).get();
+                    rbuf2 = std::move(next_buf);
                 }
 
                 o.close().get();
