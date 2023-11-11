@@ -19,6 +19,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/tmp_file.hh>
+#include <seastar/util/file.hh>
 #include <seastar/core/when_all.hh>
 
 
@@ -130,82 +131,64 @@ future<sstring> merge_sorted_chunks(sstring filename1, sstring filename2) {
     sstring out_fn = get_filename("merge");
     LOG.info("Merging {} {} -> {}", filename1, filename2, out_fn);
 
-    return with_file(open_file_dma(filename1, open_flags::ro), [filename2, out_fn] (file& f1) {
-            return with_file(open_file_dma(filename2, open_flags::ro), [&f1, out_fn] (file& f2) {
-                return with_file(open_file_dma(out_fn, wflags), [&f1, &f2, out_fn] (file& fout) {
-                        return async([&f1, &f2, &fout, out_fn] {
-                                auto rbuf1 = temporary_buffer<char>::aligned(aligned_size, record_size);
-                                auto rbuf2 = temporary_buffer<char>::aligned(aligned_size, record_size);
-                                size_t off1 = 0;
-                                size_t off2 = 0;
-                                size_t out_off = 0;
-                                future<size_t> read1 = f1.dma_read(off1, rbuf1.get_write(), record_size);
-                                future<size_t> read2 = f2.dma_read(off2, rbuf2.get_write(), record_size);
-                                auto [cnt1, cnt2] = when_all_succeed(std::move(read1), std::move(read2)).get();
+    return util::with_file_input_stream(filename1.data(), [filename2, out_fn](input_stream<char> &i1) {
+        return util::with_file_input_stream(filename2.data(), [&i1, out_fn](input_stream<char> &i2) {
+            return async([&i1, &i2, out_fn] {
+                output_stream<char> o = make_output_stream(out_fn).get0();
 
-                                Record *rec1 = Record::cast(rbuf1);
-                                Record *rec2 = Record::cast(rbuf2);
+                future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
+                future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
+                auto [rbuf1, rbuf2] = when_all_succeed(std::move(read1), std::move(read2)).get();
 
-                                while (cnt1 == record_size && cnt2 == record_size) {
-                                    auto cmp = *rec1 <=> *rec2;
+                while (rbuf1.size() == record_size && rbuf2.size() == record_size) {
+                    Record *rec1 = Record::cast(rbuf1);
+                    Record *rec2 = Record::cast(rbuf2);
 
-                                    if (cmp < 0) {
-                                        Record rec1_cp{*rec1};
-                                        off1 += record_size;
-                                        future<size_t> read1 = f1.dma_read(off1, rec1->getw(), record_size);
-                                        future<size_t> write1 = fout.dma_write(out_off, rec1_cp.get(), record_size);
-                                        auto [wcnt1, rcnt1] = when_all_succeed(std::move(write1), std::move(read1)).get();
-                                        out_off += wcnt1;
-                                        cnt1 = rcnt1;
-                                    } else if (cmp > 0) {
-                                        Record rec2_cp{*rec2};
-                                        off2 += record_size;
-                                        future<size_t> read2 = f2.dma_read(off2, rec2->getw(), record_size);
-                                        future<size_t> write2 = fout.dma_write(out_off, rec2_cp.get(), record_size);
-                                        auto [wcnt2, rcnt2] = when_all_succeed(std::move(write2), std::move(read2)).get();
-                                        out_off += wcnt2;
-                                        cnt2 = rcnt2;
-                                    } else {
-                                        Record rec1_cp[] = {*rec1, *rec1};
-                                        off1 += record_size;
-                                        future<size_t> read1 = f1.dma_read(off1, rec1->getw(), record_size);
-                                        off2 += record_size;
-                                        future<size_t> read2 = f2.dma_read(off2, rec2->getw(), record_size);
+                    auto cmp = *rec1 <=> *rec2;
 
-                                        future<size_t> write1 = fout.dma_write(out_off, rec1_cp[0].get(), 2 * record_size);
-                                        auto [wcnt1, rcnt1, rcnt2] = when_all_succeed(
-                                                std::move(write1),
-                                                std::move(read1),
-                                                std::move(read2)).get();
-                                        out_off += wcnt1;
-                                        cnt1 = rcnt1;
-                                        cnt2 = rcnt2;
-                                    }
-                                }
+                    if (cmp < 0) {
+                        future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
+                        future<> write1 = o.write(rbuf1.get(), record_size);
+                        auto [next_buf] = when_all_succeed(std::move(write1), std::move(read1)).get();
+                        rbuf1 = std::move(next_buf);
+                    } else if (cmp > 0) {
+                        future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
+                        future<> write2 = o.write(rbuf2.get(), record_size);
+                        auto [next_buf] = when_all_succeed(std::move(write2), std::move(read2)).get();
+                        rbuf2 = std::move(next_buf);
+                    } else {
+                        future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
+                        future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
 
-                                while (cnt1 == record_size) {
-                                    Record rec1_cp{*rec1};
-                                    off1 += record_size;
-                                    future<size_t> read1 = f1.dma_read(off1, rec1->getw(), record_size);
-                                    future<size_t> write1 = fout.dma_write(out_off, rec1_cp.get(), record_size);
-                                    auto [wcnt1, rcnt1] = when_all_succeed(std::move(write1), std::move(read1)).get();
-                                    out_off += wcnt1;
-                                    cnt1 = rcnt1;
-                                }
-                                while (cnt2 == record_size) {
-                                    Record rec2_cp{*rec2};
-                                    off2 += record_size;
-                                    future<size_t> read2 = f2.dma_read(off2, rec2->getw(), record_size);
-                                    future<size_t> write2 = fout.dma_write(out_off, rec2_cp.get(), record_size);
-                                    auto [wcnt2, rcnt2] = when_all_succeed(std::move(write2), std::move(read2)).get();
-                                    out_off += wcnt2;
-                                    cnt2 = rcnt2;
-                                }
-                                return out_fn;
-                            });
-                    });
-                });
+                        Record rec_cp[] = {*rec1, *rec1};
+                        future<> write = o.write(rec_cp[0].get(), 2 * record_size);
+                        auto [next_buf1, next_buf2] = when_all_succeed(
+                                std::move(write),
+                                std::move(read1),
+                                std::move(read2)).get();
+                        rbuf1 = std::move(next_buf1);
+                        rbuf2 = std::move(next_buf2);
+                    }
+                }
+
+                while (rbuf1.size() == record_size) {
+                    future<temporary_buffer<char>> read1 = i1.read_exactly(record_size);
+                    future<> write1 = o.write(rbuf1.get(), record_size);
+                    auto [next_buf] = when_all_succeed(std::move(write1), std::move(read1)).get();
+                    rbuf1 = std::move(next_buf);
+                }
+                while (rbuf2.size() == record_size) {
+                   future<temporary_buffer<char>> read2 = i2.read_exactly(record_size);
+                   future<> write2 = o.write(rbuf2.get(), record_size);
+                   auto [next_buf] = when_all_succeed(std::move(write2), std::move(read2)).get();
+                   rbuf2 = std::move(next_buf);
+                }
+
+                o.close().get();
+                return out_fn;
+            });
         });
+    });
 }
 
 struct SortTask {
@@ -325,14 +308,16 @@ future<> f() {
     fmt::print("    free memory {}\n", memory::stats().free_memory()); 
     // return seastar::make_ready_future<>();
 
-    size_t max_buffer_size = memory::stats().free_memory() / 3 / 4096 * 4096;
-    size_t min_buffer_size = std::min(1UL << 20, max_buffer_size);
-    LOG.info("max_buffer_size={} min_buffer_size={}", max_buffer_size, min_buffer_size);
+    /// size_t max_buffer_size = memory::stats().free_memory() / 3 / 4096 * 4096;
+    /// size_t min_buffer_size = std::min(1UL << 20, max_buffer_size);
+    /// LOG.info("max_buffer_size={} min_buffer_size={}", max_buffer_size, min_buffer_size);
 
 
     // TODO: uncomment these
-    // size_t max_buffer_size = 1UL << 30; // 1G
-    // size_t min_buffer_size = 1UL << 20; // 1M
+    size_t max_buffer_size = 1UL << 30; // 1G
+    size_t min_buffer_size = 1UL << 20; // 1M
+    // size_t max_buffer_size = 1UL << 20;
+    // size_t min_buffer_size = 1UL << 20;
     // size_t max_buffer_size = 4096UL;
     // size_t min_buffer_size = 4096UL;
 

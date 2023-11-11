@@ -20,7 +20,7 @@ if __name__ == '__main__':
                 break;
 
             if len(record) != RECORD_SIZE:
-                print(f'File {args.filename} contains an incomplete record')
+                print(f'File {args.filename} ends with an incomplete record')
                 exit(1);
             if prev_record is not None and record < prev_record:
                 print(f'File {args.filename} is NOT sorted')
