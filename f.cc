@@ -302,8 +302,10 @@ future<> check_params(size_t max_buffer_size, size_t min_buffer_size) {
 }
 
 future<> f() {
-    sstring filename = "data-big.txt";
-    // sstring filename = "data.txt";
+    sstring filename = "data.txt";
+
+    // TODO: remove this
+    fmt::print("    free memory {}\n", memory::stats().free_memory()); 
 
     // TODO: uncomment these
     size_t max_buffer_size = 1UL << 30; // 1G
@@ -328,8 +330,9 @@ future<> f() {
 
             return external_merge_sort(filename, size, buffer_size);
         }).then([filename](sstring fn){
-            std::rename(fn.data(), (filename + ".sorted").data());
-            LOG.info("Created sorted file: {}", fn);
+            sstring sorted_fn = filename + ".sorted";
+            std::rename(fn.data(), sorted_fn.data());
+            LOG.info("Created sorted file: {}", sorted_fn);
         }).handle_exception([] (std::exception_ptr e) {
             LOG.error("Exception: {}", e);
         });
