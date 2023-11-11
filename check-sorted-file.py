@@ -1,8 +1,8 @@
 #!/usr/bin/python
 
 import argparse
-from random import choice
-from string import ascii_letters as alphabet
+
+RECORD_SIZE = 4096
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -15,9 +15,13 @@ if __name__ == '__main__':
     with open(args.filename, 'r') as f:
         prev_record = None
         while True:
-            record = f.read(4096)
+            record = f.read(RECORD_SIZE)
             if not record:
                 break;
+
+            if len(record) != RECORD_SIZE:
+                print(f'File {args.filename} contains an incomplete record')
+                exit(1);
             if prev_record is not None and record < prev_record:
                 print(f'File {args.filename} is NOT sorted')
                 exit(1);

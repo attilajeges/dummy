@@ -25,6 +25,8 @@ using namespace seastar;
 constexpr size_t aligned_size = 4096;
 constexpr size_t record_size = 4096;
 
+const open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
+
 static logger LOG("external_merge_sort");
 
 class Record {
@@ -73,7 +75,7 @@ future<> read_chunk(sstring filename, temporary_buffer<char>& rbuf, size_t offse
 }
 
 future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
-    LOG.info("Reading and sorting {} range [{}, {})", filename, offset, offset + chunk_size);
+    LOG.info("Sorting {} range [{}, {})", filename, offset, offset + chunk_size);
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
     return do_with(std::move(rwbuf), [filename, offset, chunk_size](auto &rwbuf) {
             return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf, chunk_size] {
@@ -91,7 +93,6 @@ future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
                            return records;
                         });
                 }).then([offset, chunk_size, &rwbuf](std::vector<const Record*> records) {
-                    open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
                     sstring out_fn = get_filename("sort");
                     return with_file(open_file_dma(out_fn, wflags), [out_fn, records=std::move(records)] (file& fout) {
                             return async([&fout, out_fn, records=std::move(records)] {
@@ -110,11 +111,11 @@ future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
 
 
 future<sstring> merge_sorted_chunks(sstring filename1, sstring filename2) {
-    LOG.info("Merging {} and {}", filename1, filename2);
-    return with_file(open_file_dma(filename1, open_flags::ro), [filename2] (file& f1) {
-            return with_file(open_file_dma(filename2, open_flags::ro), [&f1] (file& f2) {
-                open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
-                sstring out_fn = get_filename("merge");
+    sstring out_fn = get_filename("merge");
+    LOG.info("Merging {} {} -> {}", filename1, filename2, out_fn);
+
+    return with_file(open_file_dma(filename1, open_flags::ro), [filename2, out_fn] (file& f1) {
+            return with_file(open_file_dma(filename2, open_flags::ro), [&f1, out_fn] (file& f2) {
                 return with_file(open_file_dma(out_fn, wflags), [&f1, &f2, out_fn] (file& fout) {
                         return async([&f1, &f2, &fout, out_fn] {
                                 auto rbuf1 = temporary_buffer<char>::aligned(aligned_size, record_size);
@@ -306,10 +307,16 @@ future<> f() {
 
     // TODO: remove this
     fmt::print("    free memory {}\n", memory::stats().free_memory()); 
+    // return seastar::make_ready_future<>();
+
+    size_t max_buffer_size = memory::stats().free_memory() / 3 / 4096 * 4096;
+    size_t min_buffer_size = std::min(1UL << 20, max_buffer_size);
+    LOG.info("max_buffer_size={} min_buffer_size={}", max_buffer_size, min_buffer_size);
+
 
     // TODO: uncomment these
-    size_t max_buffer_size = 1UL << 30; // 1G
-    size_t min_buffer_size = 1UL << 20; // 1M
+    // size_t max_buffer_size = 1UL << 30; // 1G
+    // size_t min_buffer_size = 1UL << 20; // 1M
     // size_t max_buffer_size = 4096UL;
     // size_t min_buffer_size = 4096UL;
 
@@ -337,4 +344,5 @@ future<> f() {
             LOG.error("Exception: {}", e);
         });
 }
+
 
