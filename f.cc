@@ -82,7 +82,7 @@ future<output_stream<char>> make_output_stream(std::string_view filename) {
     });
 }
 
-future<> write_to_stream(output_stream<char>& o, const std::vector<const Record*>& records) {
+future<> write_records_to_stream(output_stream<char>& o, const std::vector<const Record*>& records) {
     return seastar::do_for_each(records.begin(), records.end(), [&o] (const Record *r) {
         return o.write(r->get(), record_size);
     }).finally([&o] {
@@ -108,22 +108,22 @@ future<sstring> sort_chunk(sstring filename, size_t offset, size_t chunk_size) {
 
     auto rwbuf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
     return do_with(std::move(rwbuf), [filename, offset, chunk_size, out_fn](auto &rwbuf) {
-            return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf] {
-                    return async([&rwbuf] {
-                           std::vector<const Record*> records = make_records(rwbuf);
-                           std::sort(records.begin(), records.end(), [](const Record *p1, const Record *p2) {
-                                   return *p1 < *p2;
-                               });
-                           return records;
-                        });
-            }).then([&rwbuf, out_fn](std::vector<const Record*> records) {
-                return async([records=std::move(records), out_fn] {
-                    output_stream<char> o = make_output_stream(out_fn).get0();
-                    write_to_stream(o, records).get();
-                    return out_fn;
+        return read_chunk(filename, rwbuf, offset, chunk_size).then([&rwbuf] {
+            return async([&rwbuf] {
+                std::vector<const Record*> records = make_records(rwbuf);
+                std::sort(records.begin(), records.end(), [](const Record *p1, const Record *p2) {
+                    return *p1 < *p2;
                 });
+                return records;
+            });
+        }).then([&rwbuf, out_fn](std::vector<const Record*> records) {
+            return async([records=std::move(records), out_fn] {
+                output_stream<char> o = make_output_stream(out_fn).get0();
+                write_records_to_stream(o, records).get();
+                return out_fn;
             });
         });
+    });
 }
 
 future<sstring> merge_sorted_chunks(sstring filename1, sstring filename2) {
