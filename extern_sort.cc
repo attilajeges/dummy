@@ -30,7 +30,7 @@ constexpr size_t record_size = 4096;
 
 const open_flags wflags = open_flags::wo | open_flags::truncate | open_flags::create;
 
-static logger LOG("external_merge_sort");
+static logger LOG("extern_sort");
 
 class Record {
 public:
@@ -220,7 +220,7 @@ std::vector<SortTask> get_sort_tasks(size_t size, size_t buffer_size) {
     return sort_tasks;
 }
 
-future<sstring> external_merge_sort(sstring filename, size_t size, size_t buffer_size) {
+future<sstring> extern_sort(sstring filename, size_t size, size_t buffer_size) {
     std::vector<SortTask> sort_tasks = get_sort_tasks(size, buffer_size);
 
     return async([sort_tasks=std::move(sort_tasks), fn=std::move(filename)] {
@@ -299,7 +299,7 @@ future<> check_params(size_t max_buffer_size, size_t min_buffer_size) {
     return make_ready_future<>();
 }
 
-future<> f() {
+future<> run_extern_sort() {
     sstring filename = "data.txt";
 
     // TODO: remove this
@@ -334,7 +334,7 @@ future<> f() {
             size_t bytes_per_shard = std::max(rec_cnt_per_shard * record_size, min_buffer_size);
             size_t buffer_size = std::min(bytes_per_shard, max_buffer_size);
 
-            return external_merge_sort(filename, size, buffer_size);
+            return extern_sort(filename, size, buffer_size);
         }).then([filename](sstring fn){
             sstring sorted_fn = filename + ".sorted";
             std::rename(fn.data(), sorted_fn.data());
