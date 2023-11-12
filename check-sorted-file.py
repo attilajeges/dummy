@@ -14,7 +14,7 @@ if __name__ == '__main__':
 
     with open(args.filename, 'r') as f:
         prev_record = None
-        dup_rec_found = False
+        dup_record_count = 0;
         while True:
             record = f.read(RECORD_SIZE)
             if not record:
@@ -26,8 +26,9 @@ if __name__ == '__main__':
             if prev_record is not None and record < prev_record:
                 print(f'File {args.filename} is NOT sorted')
                 exit(1);
-            dup_rec_found = dup_rec_found or record == prev_record
+            if record == prev_record:
+                dup_record_count += 1
             prev_record = record
 
-    print(f'File {args.filename} is sorted.\nDuplicate records found: {dup_rec_found}.')
+    print(f'File {args.filename} is sorted.\nFound {dup_record_count} duplicate records.')
 
