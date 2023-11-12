@@ -69,9 +69,9 @@ sstring get_filename(std::string_view prefix) {
     return os.str();
 }
 
-future<> read_chunk(sstring fn, temporary_buffer<char>& rbuf, size_t offset, size_t chunk_size) {
-    return with_file(open_file_dma(fn, open_flags::ro), [&rbuf, offset, chunk_size] (file& f) {
-        return f.dma_read(offset, rbuf.get_write(), chunk_size).then([&rbuf, chunk_size] (size_t count) {
+future<> read_chunk(sstring fn, temporary_buffer<char>& rbuf, size_t off, size_t chunk_size) {
+    return with_file(open_file_dma(fn, open_flags::ro), [&rbuf, off, chunk_size] (file& f) {
+        return f.dma_read(off, rbuf.get_write(), chunk_size).then([&rbuf, chunk_size] (size_t count) {
             assert(count == chunk_size);
         });
     });
@@ -85,13 +85,13 @@ future<> write_chunk(sstring fn, temporary_buffer<char>& wbuf) {
     });
 }
 
-future<sstring> sort_chunk(sstring fn, size_t offset, size_t chunk_size) {
+future<sstring> sort_chunk(sstring fn, size_t off, size_t chunk_size) {
 		sstring fn_out = get_filename("sort");
-    LOG.info("Sorting {} range [{}, {}) -> {}", fn, offset, offset + chunk_size, fn_out);
+    LOG.info("Sorting {} range [{}, {}) -> {}", fn, off, off + chunk_size, fn_out);
 
     auto buf = temporary_buffer<char>::aligned(aligned_size, chunk_size);
-    return do_with(std::move(buf), [fn, offset, chunk_size, fn_out](auto &buf) {
-        return read_chunk(fn, buf, offset, chunk_size).then([&buf] {
+    return do_with(std::move(buf), [fn, off, chunk_size, fn_out](auto &buf) {
+        return read_chunk(fn, buf, off, chunk_size).then([&buf] {
             return async([&buf] {
                 Record *records = Record::cast(buf);
                 Record *records_end = records + buf.size() / record_size;
@@ -184,22 +184,21 @@ struct SortTask {
 
 std::vector<SortTask> get_sort_tasks(size_t fsize, size_t sort_buf_size) {
     std::vector<SortTask> sort_tasks;
-    size_t offset = 0;
-    while (offset < fsize) {
+    size_t off = 0;
+    while (off < fsize) {
         size_t chunk_size = 0;
-        if (offset + sort_buf_size <= fsize) {
+        if (off + sort_buf_size <= fsize) {
             chunk_size = sort_buf_size;
         } else {
-            chunk_size = fsize - offset;
+            // If there is an incomplete record at the end of the file, ignore it.
+            chunk_size = fsize - off;
             chunk_size = chunk_size / record_size * record_size;
-            if (chunk_size == 0) {
-                // Incomplete record at the end of the file, ignore it.
+            if (chunk_size == 0)
                 break;
-            }
         }
 
-        sort_tasks.emplace_back(offset, chunk_size);
-        offset += chunk_size;
+        sort_tasks.emplace_back(off, chunk_size);
+        off += chunk_size;
     }
     return sort_tasks;
 }
