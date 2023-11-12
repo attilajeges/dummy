@@ -85,6 +85,22 @@ future<> write_chunk(sstring fn, temporary_buffer<char>& wbuf) {
     });
 }
 
+class RecordWriter {
+public:
+  RecordWriter(file &fout): _fout(fout) {}
+
+  future<> write(const Record *rec) {
+    return _fout.dma_write(_off, rec->get(), record_size).then([&off = _off](size_t count) {
+        assert(count == record_size);
+        off += record_size;
+    });
+  }
+
+private:
+  file _fout;
+  size_t _off;
+};
+
 future<sstring> sort_chunk(sstring fn, size_t off, size_t chunk_size) {
 		sstring fn_out = get_filename("sort");
     LOG.info("Sorting {} range [{}, {}) -> {}", fn, off, off + chunk_size, fn_out);
@@ -105,11 +121,6 @@ future<sstring> sort_chunk(sstring fn, size_t off, size_t chunk_size) {
     });
 }
 
-future<output_stream<char>> make_output_stream(std::string_view fn) {
-    return with_file_close_on_failure(open_file_dma(fn, wflags), [] (file f) {
-        return make_file_output_stream(std::move(f), aligned_size);
-    });
-}
 
 future<sstring> merge_sorted_chunks(sstring fn1, sstring fn2) {
     sstring fn_out = get_filename("merge");
@@ -117,8 +128,13 @@ future<sstring> merge_sorted_chunks(sstring fn1, sstring fn2) {
 
     return util::with_file_input_stream(fn1.data(), [fn2, fn_out](input_stream<char> &i1) {
         return util::with_file_input_stream(fn2.data(), [&i1, fn_out](input_stream<char> &i2) {
-            return async([&i1, &i2, fn_out] {
-                output_stream<char> o = make_output_stream(fn_out).get0();
+            return with_file(open_file_dma(fn_out, wflags), [&i1, &i2, fn_out] (file& fout) {
+            return async([&i1, &i2, &fout, fn_out] {
+                auto write_record = [&fout, write_off = 0UL](const Record *rec) mutable {
+                  return fout.dma_write(write_off, rec->get(), record_size).then([&write_off](size_t count) {
+                      write_off += count;
+                  });
+                };
 
                 auto [rbuf1, rbuf2] = when_all_succeed(
                       i1.read_exactly(record_size),
@@ -132,42 +148,39 @@ future<sstring> merge_sorted_chunks(sstring fn1, sstring fn2) {
 
                     if (cmp < 0) {
                         auto [next_buf] = when_all_succeed(
-                              o.write(rec1->get(), record_size),
+                              write_record(rec1),
                               i1.read_exactly(record_size)).get();
                         rbuf1 = std::move(next_buf);
                     } else if (cmp > 0) {
                         auto [next_buf] = when_all_succeed(
-                              o.write(rec2->get(), record_size),
+                              write_record(rec2),
                               i2.read_exactly(record_size)).get();
                         rbuf2 = std::move(next_buf);
                     } else {
-                        Record recs[] = {*rec1, *rec2};
                         auto [next_buf1, next_buf2] = when_all_succeed(
-                              o.write(recs[0].get(), 2 * record_size),
+                              write_record(rec1).then([&write_record, &rec2] { return write_record(rec2);}),
                               i1.read_exactly(record_size),
                               i2.read_exactly(record_size)).get();
                         rbuf1 = std::move(next_buf1);
                         rbuf2 = std::move(next_buf2);
                     }
                 }
-
                 while (rbuf1.size() == record_size) {
                     const Record *rec1 = Record::cast(rbuf1);
                     auto [next_buf] = when_all_succeed(
-                          o.write(rec1->get(), record_size),
+                          write_record(rec1),
                           i1.read_exactly(record_size)).get();
                     rbuf1 = std::move(next_buf);
                 }
                 while (rbuf2.size() == record_size) {
                     const Record *rec2 = Record::cast(rbuf2);
                     auto [next_buf] = when_all_succeed(
-                          o.write(rec2->get(), record_size),
+                          write_record(rec2),
                           i2.read_exactly(record_size)).get();
                     rbuf2 = std::move(next_buf);
                 }
-
-                o.close().get();
                 return fn_out;
+            });
             });
         });
     });
