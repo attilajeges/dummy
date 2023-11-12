@@ -32,8 +32,8 @@ You can use as many intermediary files as you want.
    $ ./gen-test-input.sh "$(( 32 * 1024**3 ))" data.txt   ## Creates an 32GB test input file: data.txt
    ```
 2. Run `extern_sort`. It has two required positional arguments:
-   - filename: input data file
-   - max_sort_buf_size: maximum size of buffer in bytes used for initial sorting. Must be a multiple of 4096.
+   - `filename`: input data file
+   - `max_sort_buf_size`: maximum size of buffer in bytes used for initial sorting. Must be a multiple of 4096.
    ```
    $ ## Runs external sort with 8 threads on data.txt input file. Initial sorting buffer cannot be bigger than 2GB.
    $ ## The resulting sorted file will be named data.txt.sorted
